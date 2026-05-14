@@ -1,0 +1,12 @@
+[project]
+name = "test-milvus"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "adalflow>=1.1.3",
+    "faiss-cpu>=1.13.2",
+    "numpy>=2.4.4",
+    "pymilvus>=3.0.0",
+]
