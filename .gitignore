@@ -9,3 +9,10 @@ wheels/
 # Virtual environments
 .venv
 vector_stores
+.env
+config/logs
+plans
+
+# My MarkDown File
+tutorials
+
