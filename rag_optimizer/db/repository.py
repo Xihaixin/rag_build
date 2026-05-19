@@ -289,7 +289,7 @@ class IngestionJobRepository:
             updates.append("error_message = %s")
             params.append(error)
 
-        if status == "started":
+        if status in ("cloning", "parsing"):
             updates.append("started_at = NOW()")
         elif status in ("completed", "failed"):
             updates.append("completed_at = NOW()")
