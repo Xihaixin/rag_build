@@ -1,0 +1,36 @@
+{
+  "embedder": {
+    "batch_size": 16,
+    "initialize_kwargs": {},
+    "model_kwargs": {
+      "model": "text-embedding-3-small",
+      "dimensions": 256
+    }
+  },
+  "embedder_google": {
+    "model_kwargs": {
+      "model": "text-embedding-004",
+      "dimensions": 256
+    }
+  },
+  "embedder_bedrock": {
+    "model_kwargs": {
+      "model": "amazon.titan-embed-text-v2:0",
+      "dimensions": 256
+    }
+  },
+  "embedder_ollama": {
+    "model_kwargs": {
+      "model": "nomic-embed-text",
+      "dimensions": 768
+    }
+  },
+  "text_splitter": {
+    "split_by": "sentence",
+    "chunk_size": 1000,
+    "chunk_overlap": 200
+  },
+  "retriever": {
+    "top_k": 10
+  }
+}

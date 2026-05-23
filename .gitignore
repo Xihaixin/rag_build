@@ -20,3 +20,5 @@ deepwiki_open_ref
 
 node_modules
 .next
+.vscode
+
