@@ -74,7 +74,7 @@ class Project(Base):
     last_commit: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
 
     # 关系
     documents: Mapped[List["RawDocument"]] = relationship(back_populates="project", cascade="all, delete-orphan")
@@ -162,7 +162,7 @@ class DocumentChunk(Base):
     token_count: Mapped[Optional[int]] = mapped_column(Integer)
     start_offset: Mapped[Optional[int]] = mapped_column(Integer)
     end_offset: Mapped[Optional[int]] = mapped_column(Integer)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # 关系
@@ -230,7 +230,7 @@ class CodeSymbol(Base):
     end_line: Mapped[Optional[int]] = mapped_column(Integer)
     parent_symbol_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("code_symbols.id"))
     docstring: Mapped[Optional[str]] = mapped_column(Text)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # 关系
@@ -322,7 +322,7 @@ class RetrievalResult(Base):
     vector_score: Mapped[Optional[float]] = mapped_column(Float)
     keyword_score: Mapped[Optional[float]] = mapped_column(Float)
     final_score: Mapped[Optional[float]] = mapped_column(Float)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_metadata: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
 
     # 关系
     retrieval_log: Mapped["RetrievalLog"] = relationship(back_populates="results")
