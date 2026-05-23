@@ -1,0 +1,38 @@
+{
+  "embedder": {
+    "batch_size": 16,
+    "initialize_kwargs": {
+      "api_key": "${DASHSCOPE_API_KEY}"
+    },
+    "model_kwargs": {
+      "model": "text-embedding-v3",
+      "dimensions": 1024
+    }
+  },
+  "embedder_google": {
+    "model_kwargs": {
+      "model": "text-embedding-004",
+      "dimensions": 768
+    }
+  },
+  "embedder_bedrock": {
+    "model_kwargs": {
+      "model": "amazon.titan-embed-text-v2:0",
+      "dimensions": 1024
+    }
+  },
+  "embedder_ollama": {
+    "model_kwargs": {
+      "model": "nomic-embed-text",
+      "dimensions": 768
+    }
+  },
+  "text_splitter": {
+    "split_by": "sentence",
+    "chunk_size": 1000,
+    "chunk_overlap": 200
+  },
+  "retriever": {
+    "top_k": 10
+  }
+}
