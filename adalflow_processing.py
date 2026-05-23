@@ -7,7 +7,7 @@ import subprocess
 import adalflow as adal
 
 from pathlib import Path
-from LLMClients.dashscope_client import DashscopeClient
+from llm_clients.dashscope_client import DashscopeClient
 from dataclasses import dataclass, field
 from adalflow.core.db import LocalDB
 from adalflow.core.types import Document, List
