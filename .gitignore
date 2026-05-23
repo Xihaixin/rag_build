@@ -17,3 +17,5 @@ plans
 tutorials
 docs
 
+node_modules
+.next
