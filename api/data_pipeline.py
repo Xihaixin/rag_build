@@ -143,6 +143,10 @@ class DatabaseManager:
     """
     数据库管理器 — 兼容原始 deepwiki-open 的 DatabaseManager 接口
 
+    .. deprecated::
+        自 v0.1.0 起弃用。请使用 core.ingestion.ingestor.DataIngestor 进行数据摄取，
+        使用 rag_optimizer.integration.deepwiki_adapter.PgvectorRetriever 进行检索。
+
     底层使用 rag_optimizer 的 PgvectorDatabaseManager 和 PostgreSQL。
     """
 
