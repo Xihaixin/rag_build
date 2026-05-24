@@ -42,14 +42,30 @@ class ProjectRepository:
     def get_or_create(name: str, repo_url: Optional[str] = None,
                       owner: Optional[str] = None, repo_type: str = "gitee",
                       local_path: Optional[str] = None) -> dict:
-        """获取或创建项目"""
+        """获取或创建项目
+
+        先按 repo_url 查找（如果提供），再按 name 查找。
+        如果都不存在则创建新项目。
+
+        NOTE: repo_url 可能为空字符串，此时不能用于查重，
+        改用 name 作为查找条件。
+        """
+        # 按 repo_url 查找（仅当 repo_url 非空时）
         if repo_url:
             existing = sync_conn.execute(
                 "SELECT * FROM projects WHERE repo_url = %s", (repo_url,)
             )
             if existing:
-                logger.info(f"Found existing project: {repo_url}")
+                logger.info(f"Found existing project by repo_url: {repo_url}")
                 return dict(existing[0])
+
+        # 按 name 查找（兜底：当 repo_url 为空或未找到时）
+        existing = sync_conn.execute(
+            "SELECT * FROM projects WHERE name = %s", (name,)
+        )
+        if existing:
+            logger.info(f"Found existing project by name: {name}")
+            return dict(existing[0])
 
         result = sync_conn.execute(
             """INSERT INTO projects (name, repo_url, owner, repo_type, local_path)
@@ -249,8 +265,29 @@ class EmbeddingRepository:
 # 摄取任务 Repository
 # ============================================================
 
+# 数据库 ingestion_status 枚举的有效值
+# 对应 SQL: CREATE TYPE ingestion_status AS ENUM (
+#   'pending', 'cloning', 'parsing', 'chunking',
+#   'embedding', 'indexing', 'completed', 'failed'
+# );
+VALID_INGESTION_STATUSES = frozenset({
+    "pending", "cloning", "parsing", "chunking",
+    "embedding", "indexing", "completed", "failed",
+})
+
+
 class IngestionJobRepository:
     """摄取任务数据访问"""
+
+    @staticmethod
+    def _validate_status(status: str) -> str:
+        """校验状态值是否在数据库枚举中，若无效则抛出 ValueError"""
+        if status not in VALID_INGESTION_STATUSES:
+            raise ValueError(
+                f"无效的摄取状态: '{status}'。"
+                f"有效值: {', '.join(sorted(VALID_INGESTION_STATUSES))}"
+            )
+        return status
 
     @staticmethod
     def create(project_id: str, trigger_type: str = "manual") -> dict:
@@ -269,7 +306,23 @@ class IngestionJobRepository:
                       processed: Optional[int] = None,
                       total: Optional[int] = None,
                       error: Optional[str] = None):
-        """更新任务状态"""
+        """更新任务状态
+
+        Args:
+            job_id: 任务 ID
+            status: 状态值（必须是 ingestion_status 枚举中的有效值）
+            stage: 当前阶段描述
+            progress: 进度 (0.0 ~ 1.0)
+            processed: 已处理文件数
+            total: 总文件数
+            error: 错误信息
+
+        Raises:
+            ValueError: 如果 status 不是有效的枚举值
+        """
+        # 校验状态值
+        IngestionJobRepository._validate_status(status)
+
         updates = ["status = %s"]
         params = [status]
 
@@ -295,10 +348,14 @@ class IngestionJobRepository:
             updates.append("completed_at = NOW()")
 
         params.append(job_id)
-        sync_conn.execute(
-            f"UPDATE ingestion_jobs SET {', '.join(updates)} WHERE id = %s",
-            tuple(params)
-        )
+        try:
+            sync_conn.execute(
+                f"UPDATE ingestion_jobs SET {', '.join(updates)} WHERE id = %s",
+                tuple(params)
+            )
+        except Exception as e:
+            logger.error(f"更新任务状态失败 (job_id={job_id}, status={status}): {e}")
+            raise
 
     @staticmethod
     def get_pending_jobs() -> List[dict]:

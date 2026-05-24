@@ -18,12 +18,33 @@ core.ingestion.ingestor — 数据摄取器：代码仓库 → PostgreSQL + pgve
   - 复用 rag_optimizer/pipeline/ingestion.py 中的 IngestionPipeline
   - 复用 rag_optimizer/db/repository.py 中的各 Repository 类
   - 与 core/flows/ 中的各 Flow 类完全兼容，作为其前置步骤
+
+local_path 处理策略：
+  - 如果用户提供 local_path（本地已有项目），download() 会将其复制到
+    DATA_SOURCE/repos/{repo_name} 统一目录下集中管理，确保所有仓库路径一致。
+  - 复制使用 shutil.copytree 保留完整目录结构。
+  - 如果目标路径已存在且非空，则跳过复制，直接使用已有路径。
 """
 
 import logging
 import os
+import shutil
+import sys
 import time
+from pathlib import Path
+from dotenv import load_dotenv
 from typing import Any, Dict, List, Optional
+
+# 确保项目根目录在 sys.path 中（支持直接运行或 python -m 方式运行）
+# 当使用 python -m core.ingestion.ingestor 时，__file__ 可能不可靠，
+# 因此同时尝试从 __file__ 和 os.getcwd() 推导项目根目录
+_project_root_via_file = Path(__file__).resolve().parent.parent
+_project_root_via_cwd = Path(os.getcwd()).resolve()
+for _root in [_project_root_via_file, _project_root_via_cwd]:
+    _root_str = str(_root)
+    if _root_str not in sys.path and (_root / "core").is_dir():
+        sys.path.insert(0, _root_str)
+        break
 
 from core.config import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 from core.utils.repo import download_repo
@@ -38,6 +59,7 @@ from rag_optimizer.db.repository import (
 )
 from rag_optimizer.pipeline.ingestion import IngestionPipeline
 
+load_dotenv()
 logger = logging.getLogger("core.ingestion.ingestor")
 
 
@@ -75,7 +97,7 @@ class DataIngestor:
 
     def __init__(
         self,
-        repo_url: str,
+        repo_url: Optional[str] = None,
         repo_type: str = "github",
         access_token: Optional[str] = None,
         excluded_dirs: Optional[List[str]] = None,
@@ -86,7 +108,7 @@ class DataIngestor:
     ):
         """
         Args:
-            repo_url: 仓库 URL
+            repo_url: 仓库 URL（可选；如果提供 local_path 则可省略）
             repo_type: 仓库类型 (github, gitlab, bitbucket, gitee)
             access_token: 访问令牌
             excluded_dirs: 排除的目录列表
@@ -95,7 +117,10 @@ class DataIngestor:
             included_files: 包含的文件列表
             local_path: 本地路径（如果已克隆，可指定）
         """
-        self.repo_url = repo_url
+        if not repo_url and not local_path:
+            raise ValueError("必须提供 repo_url 或 local_path 其中之一")
+
+        self.repo_url = repo_url or ""
         self.repo_type = repo_type
         self.access_token = access_token
         self.excluded_dirs = excluded_dirs or DEFAULT_EXCLUDED_DIRS
@@ -104,8 +129,8 @@ class DataIngestor:
         self.included_files = included_files
         self.local_path = local_path
 
-        # 从 URL 提取仓库名
-        self.repo_name = self._extract_repo_name(repo_url)
+        # 提取仓库名：优先从 repo_url，其次从 local_path
+        self.repo_name = self._extract_repo_name(repo_url) if repo_url else self._extract_name_from_path(local_path)
 
         # 确保 DATA_SOURCE 目录存在
         ensure_data_source_dirs()
@@ -120,38 +145,58 @@ class DataIngestor:
         """从 URL 提取仓库名"""
         return repo_url.rstrip("/").split("/")[-1].replace(".git", "")
 
+    def _extract_name_from_path(self, local_path: Optional[str]) -> str:
+        """从本地路径提取仓库名（取最后一级目录名）"""
+        if not local_path:
+            raise ValueError("repo_url 和 local_path 均为空，无法提取仓库名")
+        return os.path.basename(os.path.normpath(local_path.rstrip("/\\")))
+
     # ── 步骤 1: 下载仓库 ──────────────────────────────────────────────
 
     def download(self) -> str:
         """
-        下载仓库到 DATA_SOURCE/repos/ 目录。
+        下载/复制仓库到 DATA_SOURCE/repos/ 目录。
+
+        行为：
+          - 如果提供了 local_path，将其复制到 DATA_SOURCE/repos/{repo_name} 统一管理
+          - 如果提供了 repo_url，执行 git clone 到 DATA_SOURCE/repos/{repo_name}
+          - 如果目标路径已存在且非空，跳过操作直接使用
 
         Returns:
-            str: 本地路径
+            str: 本地路径（统一在 DATA_SOURCE/repos/ 下）
         """
-        if self.local_path and os.path.exists(self.local_path):
-            logger.info(f"使用已有本地路径: {self.local_path}")
-            self.repo_local_path = self.local_path
-            return self.repo_local_path
-
-        # 统一存储到 DATA_SOURCE/repos/{repo_name}
+        # 统一目标路径
         default_path = os.path.join(REPOS_DIR, self.repo_name)
 
+        # 情况 A：目标路径已存在且非空 → 直接使用
         if os.path.exists(default_path) and os.listdir(default_path):
             logger.info(f"仓库已存在: {default_path}")
             self.repo_local_path = default_path
             return self.repo_local_path
 
-        logger.info(f"下载仓库到: {default_path}")
-        logger.info(f"仓库 URL: {self.repo_url}")
-        self.repo_local_path = download_repo(
-            repo_url=self.repo_url,
-            local_path=default_path,
-            repo_type=self.repo_type,
-            access_token=self.access_token,
-        )
-        logger.info(f"仓库下载完成: {self.repo_local_path}")
-        return self.repo_local_path
+        # 情况 B：用户提供了 local_path → 复制到统一目录
+        if self.local_path and os.path.exists(self.local_path):
+            logger.info(f"复制本地项目到统一目录: {self.local_path} → {default_path}")
+            shutil.copytree(self.local_path, default_path, symlinks=False, ignore_dangling_symlinks=True)
+            logger.info(f"复制完成: {default_path}")
+            self.repo_local_path = default_path
+            return self.repo_local_path
+
+        # 情况 C：用户提供了 repo_url → git clone
+        if self.repo_url:
+            logger.info(f"下载仓库到: {default_path}")
+            logger.info(f"仓库 URL: {self.repo_url}")
+            self.repo_local_path = download_repo(
+                repo_url=self.repo_url,
+                local_path=default_path,
+                repo_type=self.repo_type,
+                access_token=self.access_token,
+            )
+            logger.info(f"仓库下载完成: {self.repo_local_path}")
+            return self.repo_local_path
+
+        # 不应到达此处（__init__ 已校验至少有一个）
+        raise RuntimeError("没有可用的仓库来源（repo_url 和 local_path 均无效）")
 
     # ── 步骤 2: 准备数据库记录 ────────────────────────────────────────
 
@@ -244,7 +289,7 @@ class DataIngestor:
         # 更新任务状态
         if self.job_id:
             IngestionJobRepository.update_status(
-                self.job_id, "in_progress", stage="processing",
+                self.job_id, "chunking", stage="processing",
                 progress=0, processed=0, total=len(documents),
             )
 
@@ -299,12 +344,36 @@ class DataIngestor:
         """
         if self.job_id:
             status = "completed" if success else "failed"
-            IngestionJobRepository.update_status(
-                self.job_id, status,
-                stage="completed" if success else "failed",
-                progress=1.0 if success else None,
-                error=error,
-            )
+            try:
+                IngestionJobRepository.update_status(
+                    self.job_id, status,
+                    stage="completed" if success else "failed",
+                    progress=1.0 if success else None,
+                    error=error,
+                )
+            except Exception as e:
+                logger.error(f"更新任务状态失败 (job_id={self.job_id}): {e}")
+        elif not success and self.project_id:
+            # 兜底：如果 job_id 为 None（prepare 阶段失败），
+            # 尝试查找该项目的最后一个 pending 任务并标记为 failed
+            try:
+                from rag_optimizer.db.connection import sync_conn as _conn
+                pending_jobs = _conn.execute(
+                    """SELECT id FROM ingestion_jobs
+                       WHERE project_id = %s AND status = 'pending'
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (self.project_id,)
+                )
+                if pending_jobs:
+                    fallback_job_id = pending_jobs[0]["id"]
+                    IngestionJobRepository.update_status(
+                        fallback_job_id, "failed",
+                        stage="failed",
+                        error=error,
+                    )
+                    logger.info(f"已将悬挂任务 {fallback_job_id} 标记为 failed")
+            except Exception as fallback_e:
+                logger.error(f"无法更新悬挂任务状态: {fallback_e}")
 
         if success:
             logger.info("=" * 60)
@@ -360,7 +429,7 @@ class DataIngestor:
 # ============================================================
 
 def run_ingestion(
-    repo_url: str,
+    repo_url: Optional[str] = None,
     repo_type: str = "github",
     access_token: Optional[str] = None,
     excluded_dirs: Optional[List[str]] = None,
@@ -373,7 +442,7 @@ def run_ingestion(
     便捷函数 — 执行完整的数据摄取流程。
 
     Args:
-        repo_url: 仓库 URL
+        repo_url: 仓库 URL（可选；如果提供 local_path 则可省略）
         repo_type: 仓库类型
         access_token: 访问令牌
         excluded_dirs: 排除的目录
@@ -426,3 +495,9 @@ def check_project_exists(repo_url: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"检查项目是否存在时出错: {e}")
         return None
+
+if __name__ == "__main__":
+    repo_url_or_local = r"D:\ProgramFile2_OR\Python_Study_System\watchlist"
+    run_ingestion(
+        local_path=repo_url_or_local
+    )

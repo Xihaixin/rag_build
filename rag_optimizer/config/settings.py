@@ -84,7 +84,8 @@ class EmbeddingConfig:
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     # 批处理配置
-    batch_size: int = 100
+    # NOTE: DashScope text-embedding-v4 的 batch size 上限为 10
+    batch_size: int = 10
     max_retries: int = 3
     retry_delay: float = 1.0
 
