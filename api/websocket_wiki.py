@@ -3,6 +3,12 @@ WebSocket 聊天处理 — 使用 pgvector 后端的 WebSocket 流式聊天
 
 替代原始 deepwiki-open 的 websocket_wiki.py，底层使用 rag_optimizer 的
 PgvectorRetriever 进行检索。
+
+协议变更 (Phase 3):
+  - WebSocket 发送纯文本分片（兼容 deepwiki-open 前端协议）
+  - 去除 {"content": "..."} JSON 包装
+  - 去除 6 个 provider 专用 _call_*_stream_ws 函数
+  - 统一使用 core.utils.llm.call_llm_stream_raw() 进行 provider 分发
 """
 
 import json
@@ -18,7 +24,7 @@ from api.prompts import (
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
     SIMPLE_CHAT_SYSTEM_PROMPT,
 )
-from api.rag import Memory
+from core.utils.llm import call_llm_stream_raw
 from rag_optimizer.integration.deepwiki_adapter import (
     PgvectorRetriever,
     PgvectorDatabaseManager,
@@ -154,218 +160,6 @@ def build_deep_research_prompt(
 
 
 # ============================================================
-# LLM 调用函数（WebSocket 版本）
-# ============================================================
-
-
-async def call_llm_stream_ws(
-    websocket: WebSocket,
-    provider: str,
-    model: Optional[str],
-    messages: List[Dict[str, str]],
-):
-    """
-    调用 LLM 并通过 WebSocket 流式返回结果
-
-    支持多个提供者：dashscope, google, openai, openrouter, ollama
-    """
-    try:
-        from api.config import get_model_config
-
-        model_config = get_model_config(provider=provider, model=model)
-        model_kwargs = model_config.get("model_kwargs", {})
-        actual_model = model_kwargs.get("model", model or "qwen-plus")
-
-        if provider == "dashscope":
-            await _call_dashscope_stream_ws(websocket, actual_model, messages, model_kwargs)
-        elif provider == "google":
-            await _call_google_stream_ws(websocket, actual_model, messages, model_kwargs)
-        elif provider == "openai":
-            await _call_openai_stream_ws(websocket, actual_model, messages, model_kwargs)
-        elif provider == "openrouter":
-            await _call_openrouter_stream_ws(websocket, actual_model, messages, model_kwargs)
-        elif provider == "ollama":
-            await _call_ollama_stream_ws(websocket, actual_model, messages, model_kwargs)
-        else:
-            await _call_dashscope_stream_ws(websocket, actual_model, messages, model_kwargs)
-
-    except Exception as e:
-        logger.error(f"LLM call error: {e}")
-        await websocket.send_json({"error": str(e)})
-
-
-async def _call_dashscope_stream_ws(
-    websocket: WebSocket,
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-):
-    """通过 WebSocket 调用 DashScope 流式 API"""
-    from openai import AsyncOpenAI
-    from rag_optimizer.config.settings import settings
-
-    api_key = settings.embedding.dashscope_api_key
-    if not api_key:
-        await websocket.send_json({"error": "DASHSCOPE_API_KEY not configured"})
-        return
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=settings.embedding.dashscope_base_url,
-    )
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            await websocket.send_json({"content": chunk.choices[0].delta.content})
-
-
-async def _call_google_stream_ws(
-    websocket: WebSocket,
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-):
-    """通过 WebSocket 调用 Google Generative AI"""
-    import os
-    import google.generativeai as genai
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        await websocket.send_json({"error": "GOOGLE_API_KEY not configured"})
-        return
-
-    genai.configure(api_key=api_key)
-    client = genai.GenerativeModel(model)
-
-    chat_messages = []
-    for msg in messages:
-        if msg["role"] != "system":
-            chat_messages.append({"role": msg["role"], "parts": [msg["content"]]})
-
-    chat = client.start_chat(history=chat_messages[:-1] if len(chat_messages) > 1 else [])
-    response = await chat.send_message_async(
-        chat_messages[-1]["parts"][0] if chat_messages else "",
-    )
-    await websocket.send_json({"content": response.text})
-
-
-async def _call_openai_stream_ws(
-    websocket: WebSocket,
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-):
-    """通过 WebSocket 调用 OpenAI 流式 API"""
-    from openai import AsyncOpenAI
-    import os
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        await websocket.send_json({"error": "OPENAI_API_KEY not configured"})
-        return
-
-    client = AsyncOpenAI(api_key=api_key)
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            await websocket.send_json({"content": chunk.choices[0].delta.content})
-
-
-async def _call_openrouter_stream_ws(
-    websocket: WebSocket,
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-):
-    """通过 WebSocket 调用 OpenRouter 流式 API"""
-    from openai import AsyncOpenAI
-    import os
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        await websocket.send_json({"error": "OPENROUTER_API_KEY not configured"})
-        return
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            await websocket.send_json({"content": chunk.choices[0].delta.content})
-
-
-async def _call_ollama_stream_ws(
-    websocket: WebSocket,
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-):
-    """通过 WebSocket 调用 Ollama 流式 API"""
-    import httpx
-    import os
-
-    ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    options = model_kwargs.get("options", {})
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "options": {
-            "temperature": options.get("temperature", 0.7),
-            "top_p": options.get("top_p", 0.8),
-            "num_ctx": options.get("num_ctx", 32000),
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", f"{ollama_base_url}/api/chat", json=payload) as response:
-            async for line in response.aiter_lines():
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        if "message" in data and "content" in data["message"]:
-                            await websocket.send_json({"content": data["message"]["content"]})
-                    except json.JSONDecodeError:
-                        continue
-
-
-# ============================================================
 # WebSocket 处理函数
 # ============================================================
 
@@ -374,8 +168,14 @@ async def handle_websocket_chat(websocket: WebSocket):
     """
     处理 WebSocket 聊天连接
 
-    接收 JSON 格式的请求，流式返回 LLM 响应。
+    接收 JSON 格式的请求，流式返回 LLM 响应（纯文本分片）。
     支持普通聊天和深度研究两种模式。
+
+    协议 (Phase 3):
+      - 接收: JSON 格式请求
+      - 发送: 纯文本分片（逐 token），兼容 deepwiki-open 前端
+      - 完成: 发送 "[DONE]" 标记
+      - 错误: 发送 "[ERROR: ...]" 标记
     """
     await websocket.accept()
     logger.info("WebSocket connection accepted")
@@ -459,7 +259,7 @@ async def handle_websocket_chat(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
         try:
-            await websocket.send_json({"error": str(e)})
+            await websocket.send_text(f"[ERROR: {e}]")
         except Exception:
             pass
     finally:
@@ -480,7 +280,7 @@ async def _handle_simple_chat_ws(
     model: Optional[str],
     retriever: Optional[PgvectorRetriever],
 ):
-    """处理普通 WebSocket 聊天"""
+    """处理普通 WebSocket 聊天 — 纯文本分片推流"""
     try:
         # 检索相关文档
         contexts = None
@@ -507,20 +307,20 @@ async def _handle_simple_chat_ws(
             {"role": "user", "content": query},
         ]
 
-        # 流式调用 LLM
-        await call_llm_stream_ws(
-            websocket=websocket,
+        # 流式调用 LLM — 纯文本分片
+        async for chunk in call_llm_stream_raw(
             provider=provider,
             model=model,
             messages=messages,
-        )
+        ):
+            await websocket.send_text(chunk)
 
         # 发送完成信号
-        await websocket.send_json({"done": True})
+        await websocket.send_text("[DONE]")
 
     except Exception as e:
         logger.error(f"Simple chat error: {e}", exc_info=True)
-        await websocket.send_json({"error": str(e)})
+        await websocket.send_text(f"[ERROR: {e}]")
 
 
 async def _handle_deep_research_ws(
@@ -535,9 +335,10 @@ async def _handle_deep_research_ws(
     retriever: Optional[PgvectorRetriever],
     iterations: int = 5,
 ):
-    """处理深度研究 WebSocket 聊天"""
+    """处理深度研究 WebSocket 聊天 — 纯文本分片推流"""
     try:
-        memory = Memory()
+        # 使用简单的内存对话跟踪（替代 api.rag.Memory）
+        conversation_turns: List[Dict[str, str]] = []
 
         for i in range(1, iterations + 1):
             # 检索相关文档
@@ -549,7 +350,16 @@ async def _handle_deep_research_ws(
                     logger.warning(f"Research iteration {i} retrieval error: {e}")
 
             # 构建深度研究提示词
-            conversation_history = memory() if i > 1 else None
+            conversation_history = None
+            if conversation_turns:
+                conversation_history = {
+                    str(idx): {
+                        "user_query": {"data": turn["user"]},
+                        "assistant_response": {"data": turn["assistant"]},
+                    }
+                    for idx, turn in enumerate(conversation_turns)
+                }
+
             prompt = build_deep_research_prompt(
                 query=query,
                 repo_url=repo_url,
@@ -573,40 +383,28 @@ async def _handle_deep_research_ws(
                 messages.insert(1, {"role": "user", "content": f"Context:\n{context_text}"})
 
             # 发送迭代开始信号
-            await websocket.send_json({"iteration_start": i})
+            await websocket.send_text(f"[ITERATION_START:{i}]")
 
-            # 流式调用 LLM
-            full_response_chars = []
-            original_send = websocket.send_json
-
-            # 自定义发送以收集响应
-            async def send_with_collection(data):
-                if "content" in data:
-                    full_response_chars.append(data["content"])
-                await original_send(data)
-
-            websocket.send_json = send_with_collection
-
-            await call_llm_stream_ws(
-                websocket=websocket,
+            # 流式调用 LLM — 纯文本分片，同时收集完整响应
+            full_response_chars: List[str] = []
+            async for chunk in call_llm_stream_raw(
                 provider=provider,
                 model=model,
                 messages=messages,
-            )
+            ):
+                full_response_chars.append(chunk)
+                await websocket.send_text(chunk)
 
-            # 恢复原始 send 方法
-            websocket.send_json = original_send
-
-            # 保存到记忆
+            # 保存到对话历史
             full_response = "".join(full_response_chars)
-            memory.add_dialog_turn(query, full_response)
+            conversation_turns.append({"user": query, "assistant": full_response})
 
             # 发送迭代完成信号
-            await websocket.send_json({"iteration_done": i})
+            await websocket.send_text(f"[ITERATION_DONE:{i}]")
 
         # 发送完成信号
-        await websocket.send_json({"done": True, "iterations": iterations})
+        await websocket.send_text(f"[DONE:{iterations}]")
 
     except Exception as e:
         logger.error(f"Deep research error: {e}", exc_info=True)
-        await websocket.send_json({"error": str(e)})
+        await websocket.send_text(f"[ERROR: {e}]")

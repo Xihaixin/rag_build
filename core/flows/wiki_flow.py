@@ -71,8 +71,8 @@ class WikiGenerationFlow(BaseFlow):
     def __init__(
         self,
         repo_url: str,
-        provider: str = "google",
-        model: str = "gemini-2.0-flash-exp",
+        provider: str = "dashscope",
+        model: str = "qwen-plus",
         language: str = "zh",
         comprehensive: bool = True,
         use_database: bool = True,

@@ -85,8 +85,8 @@ def load_configs() -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"加载生成器配置失败: {e}")
         configs["generator"] = {
-            "default_provider": "google",
-            "default_model": "gemini-2.0-flash-exp",
+            "default_provider": "dashscope",
+            "default_model": "qwen-plus",
         }
 
     try:
@@ -168,8 +168,8 @@ class BaseFlow:
     def __init__(
         self,
         repo_url: str,
-        provider: str = "google",
-        model: str = "gemini-2.0-flash-exp",
+        provider: str = "dashscope",
+        model: str = "qwen-plus",
         language: str = "zh",
         use_database: bool = True,
     ):

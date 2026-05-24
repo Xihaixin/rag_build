@@ -4,13 +4,12 @@
 替代原始 deepwiki-open 的 simple_chat.py，底层使用 rag_optimizer 的
 PgvectorRetriever 进行检索，支持多种 LLM 提供者。
 
-注意: call_llm_stream 及所有 _call_*_stream 函数已迁移至
-core.utils.llm，此处仅做重导出以保持向后兼容。
+注意: call_llm_stream 已迁移至 core.utils.llm，此处仅做重导出以保持向后兼容。
 """
 
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -23,15 +22,7 @@ from api.prompts import (
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
     SIMPLE_CHAT_SYSTEM_PROMPT,
 )
-from api.rag import Memory
-from core.utils.llm import (
-    call_llm_stream,
-    _call_dashscope_stream,
-    _call_google_stream,
-    _call_openai_stream,
-    _call_openrouter_stream,
-    _call_ollama_stream,
-)
+from core.utils.llm import call_llm_stream
 from rag_optimizer.integration.deepwiki_adapter import (
     PgvectorRetriever,
     PgvectorDatabaseManager,
@@ -255,7 +246,8 @@ async def _handle_simple_chat(
     repo_name: str,
 ) -> StreamingResponse:
     """处理普通聊天模式"""
-    memory = Memory()
+    # 使用简单列表跟踪对话（替代 api.rag.Memory）
+    conversation_turns: List[Dict[str, str]] = []
 
     async def response_stream():
         try:
@@ -307,7 +299,7 @@ async def _handle_simple_chat(
                 yield chunk
 
             # 记录对话
-            memory.add_dialog_turn(query, "[streaming response]")
+            conversation_turns.append({"user": query, "assistant": "[streaming response]"})
 
         except Exception as e:
             logger.error(f"Simple chat stream error: {e}")
@@ -330,7 +322,7 @@ async def _handle_deep_research(
     repo_name: str,
 ) -> StreamingResponse:
     """处理深度研究模式"""
-    memory = Memory()
+    conversation_turns: List[Dict[str, str]] = []
     total_iterations = request.research_iterations
 
     async def research_stream():
@@ -372,7 +364,13 @@ async def _handle_deep_research(
                     language=request.language or "en",
                     iteration=iteration,
                     total_iterations=total_iterations,
-                    conversation_history=memory() if hasattr(memory, '__call__') else None,
+                    conversation_history={
+                        str(idx): {
+                            "user_query": {"data": turn["user"]},
+                            "assistant_response": {"data": turn["assistant"]},
+                        }
+                        for idx, turn in enumerate(conversation_turns)
+                    } if conversation_turns else None,
                 )
 
                 # 发送迭代标记
@@ -390,10 +388,10 @@ async def _handle_deep_research(
                     yield chunk
 
                 # 记录对话
-                memory.add_dialog_turn(
-                    f"{query} (iteration {iteration}/{total_iterations})",
-                    full_response,
-                )
+                conversation_turns.append({
+                    "user": f"{query} (iteration {iteration}/{total_iterations})",
+                    "assistant": full_response,
+                })
 
             # 发送完成标记
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
