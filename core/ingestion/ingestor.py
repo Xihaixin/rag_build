@@ -13,7 +13,8 @@ core.ingestion.ingestor — 数据摄取器：代码仓库 → PostgreSQL + pgve
   5. finalize()    — 更新任务状态，返回统计信息
 
 设计原则：
-  - 复用 api/data_pipeline.py 中已有的 download_repo() 和 read_all_documents()
+  - 复用 core/utils/repo.py 中的 download_repo()
+  - 复用 core/utils/documents.py 中的 read_all_documents()
   - 复用 rag_optimizer/pipeline/ingestion.py 中的 IngestionPipeline
   - 复用 rag_optimizer/db/repository.py 中的各 Repository 类
   - 与 core/flows/ 中的各 Flow 类完全兼容，作为其前置步骤
@@ -24,8 +25,9 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from api.config import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
-from api.data_pipeline import download_repo, read_all_documents
+from core.config import DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
+from core.utils.repo import download_repo
+from core.utils.documents import read_all_documents
 from rag_optimizer.db.repository import (
     ProjectRepository,
     DocumentRepository,
