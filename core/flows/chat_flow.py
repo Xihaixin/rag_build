@@ -13,7 +13,7 @@ chat_flow.py — 用户 Q&A 简单聊天流
 依赖:
   - core.flows.base — BaseFlow 公共基类
   - core.models — Message
-  - api.prompts — SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
+  - core.prompts.rag — SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
 """
 
 import logging
@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
 from core.models import Message
-from api.prompts import SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
+from core.prompts.rag import SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
 
 logger = logging.getLogger("core.flows.chat")
 

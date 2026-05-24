@@ -15,8 +15,7 @@ base.py — 业务流公共基类
   - core.config — 统一配置加载
   - core.utils.llm — call_llm_stream
   - core.utils.sse — parse_sse_chunk, call_llm_and_collect
-  - api.prompts — Prompt 模板
-  - api.simple_chat — get_language_name
+  - core.utils.language — get_language_name
   - rag_optimizer.integration.deepwiki_adapter — PgvectorRetriever
   - rag_optimizer.db.repository — ProjectRepository
 """
@@ -30,7 +29,7 @@ from core.config import (
 )
 from core.utils.llm import call_llm_stream
 from core.utils.sse import parse_sse_chunk, call_llm_and_collect
-from api.simple_chat import get_language_name as _get_language_name
+from core.utils.language import get_language_name as _get_language_name
 from rag_optimizer.integration.deepwiki_adapter import PgvectorRetriever
 from rag_optimizer.db.repository import ProjectRepository
 

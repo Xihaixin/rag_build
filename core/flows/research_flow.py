@@ -14,7 +14,7 @@ research_flow.py — 深度研究流
 依赖:
   - core.flows.base — BaseFlow 公共基类
   - core.models — Message, ResearchStage
-  - api.prompts — DEEP_RESEARCH_*_ITERATION_PROMPT, SIMPLE_CHAT_SYSTEM_PROMPT
+  - core.prompts.rag — DEEP_RESEARCH_*_ITERATION_PROMPT, SIMPLE_CHAT_SYSTEM_PROMPT
 """
 
 import logging
@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
 from core.models import Message, ResearchStage
-from api.prompts import (
+from core.prompts.rag import (
     SIMPLE_CHAT_SYSTEM_PROMPT,
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,

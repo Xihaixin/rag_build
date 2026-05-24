@@ -14,7 +14,7 @@ from adalflow.core.types import Document, List
 from typing import Any, List, Tuple, Dict
 from urllib.parse import urlparse, urlunparse, quote
 from adalflow.components.data_process import TextSplitter, ToEmbeddings
-from default_prompts.prompts import RAG_TEMPLATE, RAG_SYSTEM_PROMPT as system_prompt
+from api.prompts import RAG_TEMPLATE, RAG_SYSTEM_PROMPT as system_prompt
 from adalflow.components.retriever.faiss_retriever import FAISSRetriever
 from utils.read_all_documents import read_all_documents, DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES
 

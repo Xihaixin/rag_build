@@ -17,14 +17,15 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from api.config import configs
-from api.prompts import (
+from core.prompts.rag import (
+
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
     DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
     SIMPLE_CHAT_SYSTEM_PROMPT,
 )
 from core.utils.llm import call_llm_stream_raw
+from core.utils.language import get_language_name
 from rag_optimizer.integration.deepwiki_adapter import (
     PgvectorRetriever,
     PgvectorDatabaseManager,
@@ -38,14 +39,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 
-def get_language_name(language_code: str) -> str:
-    """获取语言名称"""
-    lang_config = configs.get("lang_config", {})
-    supported = lang_config.get("supported_languages", {})
-    return supported.get(language_code, "English")
-
-
 def build_context_from_results(results: List[Any]) -> str:
+
     """从检索结果构建上下文文本"""
     context_parts = []
     for i, doc in enumerate(results):
@@ -199,10 +194,9 @@ async def handle_websocket_chat(websocket: WebSocket):
         included_dirs = request_data.get("included_dirs")
         included_files = request_data.get("included_files")
 
-        # 语言验证
-        supported_langs = configs.get("lang_config", {}).get("supported_languages", {})
-        if language not in supported_langs:
-            language = "en"
+        # 语言验证 — 使用 core.utils.language 验证
+        from core.utils.language import validate_language
+        language = validate_language(language, default="en")
 
         # 提取仓库名
         repo_url = repo_url.rstrip("/")
@@ -211,6 +205,7 @@ async def handle_websocket_chat(websocket: WebSocket):
         # 准备检索器
         try:
             db_manager = PgvectorDatabaseManager()
+
             project_id = db_manager.prepare_database(
                 repo_url_or_path=repo_url,
                 repo_type=repo_type,

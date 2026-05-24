@@ -1,10 +1,13 @@
 """
 流式聊天端点 — 使用 pgvector 后端的 HTTP SSE 流式聊天
 
-替代原始 deepwiki-open 的 simple_chat.py，底层使用 rag_optimizer 的
-PgvectorRetriever 进行检索，支持多种 LLM 提供者。
+替代原始 deepwiki-open 的 simple_chat.py，底层使用 core/flows/ 中的
+SimpleChatFlow 和 DeepResearchFlow 进行业务逻辑处理。
 
-注意: call_llm_stream 已迁移至 core.utils.llm，此处仅做重导出以保持向后兼容。
+架构说明 (Phase 4 重构):
+  - API 层只负责 HTTP 协议处理（请求解析、SSE 流式响应）
+  - 业务逻辑（RAG 检索、prompt 构建）委托给 core/flows/ 中的 Flow 类
+  - LLM 流式调用使用 core.utils.llm.call_llm_stream()
 """
 
 import json
@@ -15,18 +18,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from api.config import configs
-from api.prompts import (
-    DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
-    DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
-    DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
-    SIMPLE_CHAT_SYSTEM_PROMPT,
-)
+from core.flows.chat_flow import SimpleChatFlow
+from core.flows.research_flow import DeepResearchFlow
 from core.utils.llm import call_llm_stream
-from rag_optimizer.integration.deepwiki_adapter import (
-    PgvectorRetriever,
-    PgvectorDatabaseManager,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -60,132 +54,6 @@ class ChatCompletionRequest(BaseModel):
 
 
 # ============================================================
-# 辅助函数
-# ============================================================
-
-
-def get_language_name(language_code: str) -> str:
-    """获取语言名称"""
-    lang_config = configs.get("lang_config", {})
-    supported = lang_config.get("supported_languages", {})
-    return supported.get(language_code, "English")
-
-
-def build_context_from_results(results: List[Any]) -> str:
-    """从检索结果构建上下文文本"""
-    context_parts = []
-    for i, doc in enumerate(results):
-        file_path = (
-            getattr(doc, "meta", {}).get("file_path", "unknown")
-            if hasattr(doc, "meta")
-            else "unknown"
-        )
-        text = getattr(doc, "text", "") if hasattr(doc, "text") else ""
-        context_parts.append(f"{i + 1}.\nFile Path: {file_path}\nContent: {text}")
-    return "\n".join(context_parts)
-
-
-def build_simple_chat_prompt(
-    query: str,
-    repo_url: str,
-    repo_name: str,
-    repo_type: str,
-    language: str,
-    contexts: Optional[List[Any]] = None,
-    conversation_history: Optional[Dict] = None,
-) -> str:
-    """构建简单聊天提示词"""
-    language_name = get_language_name(language)
-
-    system_prompt = SIMPLE_CHAT_SYSTEM_PROMPT.format(
-        repo_type=repo_type,
-        repo_url=repo_url,
-        repo_name=repo_name,
-        language_name=language_name,
-    )
-
-    prompt_parts = [f"<system>{system_prompt}</system>"]
-
-    if conversation_history:
-        prompt_parts.append("<conversation_history>")
-        for key, turn in conversation_history.items():
-            user_query = turn.get("user_query", {})
-            assistant_response = turn.get("assistant_response", {})
-            if isinstance(user_query, dict):
-                prompt_parts.append(f"User: {user_query.get('data', str(user_query))}")
-            else:
-                prompt_parts.append(f"User: {str(user_query)}")
-            if isinstance(assistant_response, dict):
-                prompt_parts.append(
-                    f"Assistant: {assistant_response.get('data', str(assistant_response))}"
-                )
-            else:
-                prompt_parts.append(f"Assistant: {str(assistant_response)}")
-        prompt_parts.append("</conversation_history>")
-
-    if contexts:
-        prompt_parts.append("<context>")
-        prompt_parts.append(build_context_from_results(contexts))
-        prompt_parts.append("</context>")
-
-    prompt_parts.append(f"<user_query>{query}</user_query>")
-
-    return "\n".join(prompt_parts)
-
-
-def build_deep_research_prompt(
-    query: str,
-    repo_url: str,
-    repo_name: str,
-    repo_type: str,
-    language: str,
-    iteration: int,
-    total_iterations: int,
-    conversation_history: Optional[Dict] = None,
-) -> str:
-    """构建深度研究提示词"""
-    language_name = get_language_name(language)
-
-    if iteration == 1:
-        prompt_template = DEEP_RESEARCH_FIRST_ITERATION_PROMPT
-    elif iteration >= total_iterations:
-        prompt_template = DEEP_RESEARCH_FINAL_ITERATION_PROMPT
-    else:
-        prompt_template = DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT
-
-    system_prompt = prompt_template.format(
-        repo_type=repo_type,
-        repo_url=repo_url,
-        repo_name=repo_name,
-        language_name=language_name,
-        research_iteration=iteration,
-    )
-
-    prompt_parts = [f"<system>{system_prompt}</system>"]
-
-    if conversation_history:
-        prompt_parts.append("<conversation_history>")
-        for key, turn in conversation_history.items():
-            user_query = turn.get("user_query", {})
-            assistant_response = turn.get("assistant_response", {})
-            if isinstance(user_query, dict):
-                prompt_parts.append(f"User: {user_query.get('data', str(user_query))}")
-            else:
-                prompt_parts.append(f"User: {str(user_query)}")
-            if isinstance(assistant_response, dict):
-                prompt_parts.append(
-                    f"Assistant: {assistant_response.get('data', str(assistant_response))}"
-                )
-            else:
-                prompt_parts.append(f"Assistant: {str(assistant_response)}")
-        prompt_parts.append("</conversation_history>")
-
-    prompt_parts.append(f"<user_query>{query}</user_query>")
-
-    return "\n".join(prompt_parts)
-
-
-# ============================================================
 # 聊天补全端点（SSE 流式）
 # ============================================================
 
@@ -197,6 +65,10 @@ async def chat_completions_stream(request: ChatCompletionRequest):
 
     支持多种 LLM 提供者，通过 SSE (Server-Sent Events) 流式返回结果。
     支持普通聊天和深度研究两种模式。
+
+    业务逻辑委托给:
+      - SimpleChatFlow — 普通聊天模式
+      - DeepResearchFlow — 深度研究模式
     """
     try:
         query = request.messages[-1]["content"] if request.messages else ""
@@ -207,7 +79,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
             f"query='{query[:50]}...'"
         )
 
-        # 如果没有仓库 URL，直接调用 LLM
+        # 如果没有仓库 URL，直接调用 LLM（无需 RAG）
         if not request.repo_url:
             async def direct_stream():
                 async for chunk in call_llm_stream(
@@ -245,61 +117,46 @@ async def _handle_simple_chat(
     query: str,
     repo_name: str,
 ) -> StreamingResponse:
-    """处理普通聊天模式"""
-    # 使用简单列表跟踪对话（替代 api.rag.Memory）
-    conversation_turns: List[Dict[str, str]] = []
+    """
+    处理普通聊天模式 — 委托给 SimpleChatFlow
+
+    SimpleChatFlow 负责:
+      1. 初始化 RAG 检索器
+      2. 构建 RAG 上下文
+      3. 构建 prompt（系统指令 + 上下文 + 用户问题）
+
+    API 层负责:
+      - 流式调用 LLM 并返回 SSE 响应
+    """
+    # 初始化 SimpleChatFlow（repo_url 在此路径下保证不为 None）
+    repo_url: str = request.repo_url  # type: ignore[assignment]
+    flow = SimpleChatFlow(
+        repo_url=repo_url,
+        provider=request.provider,
+        model=request.model or "qwen-plus",
+        language=request.language or "en",
+        use_database=True,
+    )
+
 
     async def response_stream():
         try:
-            # 初始化检索器
-            retriever = None
-            try:
-                db_manager = PgvectorDatabaseManager()
-                project_id = db_manager.prepare_database(
-                    repo_url_or_path=request.repo_url,
-                    repo_type=request.repo_type or "github",
-                    access_token=request.token,
-                )
-                retriever = PgvectorRetriever(
-                    project_id=project_id,
-                    retrieval_type="hybrid",
-                    top_k=10,
-                )
-            except Exception as e:
-                logger.warning(f"Could not initialize retriever: {e}")
+            # 步骤 1: 初始化 RAG 检索器
+            flow._init_retriever(top_k=10)
 
-            # 执行检索
-            contexts = None
-            if retriever:
-                try:
-                    results, _ = retriever(query, k=10) if hasattr(retriever, '__call__') else ([], {})
-                    if results:
-                        contexts = results
-                except Exception as e:
-                    logger.warning(f"Retrieval error: {e}")
+            # 步骤 2: 构建 RAG 上下文
+            context = flow._build_context(query)
 
-            # 构建提示词
-            prompt = build_simple_chat_prompt(
-                query=query,
-                repo_url=request.repo_url,
-                repo_name=repo_name,
-                repo_type=request.repo_type or "github",
-                language=request.language or "en",
-                contexts=contexts,
-                conversation_history=None,
-            )
+            # 步骤 3: 构建 prompt
+            messages = flow._build_prompt(query, context)
 
-            # 调用 LLM
-            messages = [{"role": "user", "content": prompt}]
+            # 步骤 4: 流式调用 LLM
             async for chunk in call_llm_stream(
                 provider=request.provider,
                 model=request.model,
                 messages=messages,
             ):
                 yield chunk
-
-            # 记录对话
-            conversation_turns.append({"user": query, "assistant": "[streaming response]"})
 
         except Exception as e:
             logger.error(f"Simple chat stream error: {e}")
@@ -321,63 +178,57 @@ async def _handle_deep_research(
     query: str,
     repo_name: str,
 ) -> StreamingResponse:
-    """处理深度研究模式"""
-    conversation_turns: List[Dict[str, str]] = []
+    """
+    处理深度研究模式 — 委托给 DeepResearchFlow
+
+    DeepResearchFlow 负责:
+      1. 初始化 RAG 检索器
+      2. 构建 RAG 上下文
+      3. 构建研究 prompt（根据迭代次数选择模板）
+
+    API 层负责:
+      - 迭代循环控制
+      - 流式调用 LLM 并返回 SSE 响应
+      - 发送迭代标记（iteration/done）
+    """
+    # 初始化 DeepResearchFlow（repo_url 在此路径下保证不为 None）
+    repo_url: str = request.repo_url  # type: ignore[assignment]
+    flow = DeepResearchFlow(
+        repo_url=repo_url,
+        provider=request.provider,
+        model=request.model or "qwen-plus",
+        language=request.language or "en",
+        use_database=True,
+    )
+
     total_iterations = request.research_iterations
+    conversation_turns: List[Dict[str, str]] = []
 
     async def research_stream():
         try:
-            # 初始化检索器
-            retriever = None
-            try:
-                db_manager = PgvectorDatabaseManager()
-                project_id = db_manager.prepare_database(
-                    repo_url_or_path=request.repo_url,
-                    repo_type=request.repo_type or "github",
-                    access_token=request.token,
-                )
-                retriever = PgvectorRetriever(
-                    project_id=project_id,
-                    retrieval_type="hybrid",
-                    top_k=10,
-                )
-            except Exception as e:
-                logger.warning(f"Could not initialize retriever: {e}")
+            # 初始化 RAG 检索器
+            flow._init_retriever(top_k=10)
 
             for iteration in range(1, total_iterations + 1):
-                # 执行检索
-                contexts = None
-                if retriever:
-                    try:
-                        results, _ = retriever(query, k=10) if hasattr(retriever, '__call__') else ([], {})
-                        if results:
-                            contexts = results
-                    except Exception as e:
-                        logger.warning(f"Retrieval error at iteration {iteration}: {e}")
+                # 构建 RAG 上下文
+                context = flow._build_context(query)
 
-                # 构建深度研究提示词
-                prompt = build_deep_research_prompt(
+                # 构建研究 prompt
+                messages = flow._build_research_prompt(
                     query=query,
-                    repo_url=request.repo_url,
-                    repo_name=repo_name,
-                    repo_type=request.repo_type or "github",
-                    language=request.language or "en",
                     iteration=iteration,
-                    total_iterations=total_iterations,
-                    conversation_history={
-                        str(idx): {
-                            "user_query": {"data": turn["user"]},
-                            "assistant_response": {"data": turn["assistant"]},
-                        }
-                        for idx, turn in enumerate(conversation_turns)
-                    } if conversation_turns else None,
+                    context=context,
                 )
+
+                # 如果有对话历史，添加到 messages 中
+                for turn in conversation_turns:
+                    messages.append({"role": "assistant", "content": turn["assistant"]})
+                    messages.append({"role": "user", "content": "[DEEP RESEARCH] Continue the research"})
 
                 # 发送迭代标记
                 yield f"data: {json.dumps({'type': 'iteration', 'iteration': iteration, 'total': total_iterations})}\n\n"
 
-                # 调用 LLM
-                messages = [{"role": "user", "content": prompt}]
+                # 流式调用 LLM
                 full_response = ""
                 async for chunk in call_llm_stream(
                     provider=request.provider,
