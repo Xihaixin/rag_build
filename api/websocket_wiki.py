@@ -1,14 +1,19 @@
 """
 WebSocket 聊天处理 — 使用 pgvector 后端的 WebSocket 流式聊天
 
-替代原始 deepwiki-open 的 websocket_wiki.py，底层使用 rag_optimizer 的
-PgvectorRetriever 进行检索。
+替代原始 deepwiki-open 的 websocket_wiki.py，底层使用 core/flows/ 中的
+SimpleChatFlow 和 DeepResearchFlow 进行业务逻辑处理。
 
-协议变更 (Phase 3):
-  - WebSocket 发送纯文本分片（兼容 deepwiki-open 前端协议）
-  - 去除 {"content": "..."} JSON 包装
-  - 去除 6 个 provider 专用 _call_*_stream_ws 函数
-  - 统一使用 core.utils.llm.call_llm_stream_raw() 进行 provider 分发
+架构说明 (Phase 4 重构):
+  - API 层只负责 WebSocket 协议处理（连接管理、纯文本分片推流）
+  - 业务逻辑（RAG 检索、prompt 构建）委托给 core/flows/ 中的 Flow 类
+  - LLM 流式调用使用 core.utils.llm.call_llm_stream_raw()
+
+协议:
+  - 接收: JSON 格式请求
+  - 发送: 纯文本分片（逐 token），兼容 deepwiki-open 前端
+  - 完成: 发送 "[DONE]" 标记
+  - 错误: 发送 "[ERROR: ...]" 标记
 """
 
 import json
@@ -17,141 +22,12 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from core.prompts.rag import (
-
-    DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
-    DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
-    DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
-    SIMPLE_CHAT_SYSTEM_PROMPT,
-)
+from core.flows.chat_flow import SimpleChatFlow
+from core.flows.research_flow import DeepResearchFlow
 from core.utils.llm import call_llm_stream_raw
-from core.utils.language import get_language_name
-from rag_optimizer.integration.deepwiki_adapter import (
-    PgvectorRetriever,
-    PgvectorDatabaseManager,
-)
+from core.utils.language import validate_language
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# 辅助函数
-# ============================================================
-
-
-def build_context_from_results(results: List[Any]) -> str:
-
-    """从检索结果构建上下文文本"""
-    context_parts = []
-    for i, doc in enumerate(results):
-        file_path = (
-            getattr(doc, "meta", {}).get("file_path", "unknown")
-            if hasattr(doc, "meta")
-            else "unknown"
-        )
-        text = getattr(doc, "text", "") if hasattr(doc, "text") else ""
-        context_parts.append(f"{i + 1}.\nFile Path: {file_path}\nContent: {text}")
-    return "\n".join(context_parts)
-
-
-def build_simple_chat_prompt(
-    query: str,
-    repo_url: str,
-    repo_name: str,
-    repo_type: str,
-    language: str,
-    contexts: Optional[List[Any]] = None,
-    conversation_history: Optional[Dict] = None,
-) -> str:
-    """构建简单聊天提示词"""
-    language_name = get_language_name(language)
-
-    system_prompt = SIMPLE_CHAT_SYSTEM_PROMPT.format(
-        repo_type=repo_type,
-        repo_url=repo_url,
-        repo_name=repo_name,
-        language_name=language_name,
-    )
-
-    prompt_parts = [f"<system>{system_prompt}</system>"]
-
-    if conversation_history:
-        prompt_parts.append("<conversation_history>")
-        for key, turn in conversation_history.items():
-            user_query = turn.get("user_query", {})
-            assistant_response = turn.get("assistant_response", {})
-            if isinstance(user_query, dict):
-                prompt_parts.append(f"User: {user_query.get('data', str(user_query))}")
-            else:
-                prompt_parts.append(f"User: {str(user_query)}")
-            if isinstance(assistant_response, dict):
-                prompt_parts.append(
-                    f"Assistant: {assistant_response.get('data', str(assistant_response))}"
-                )
-            else:
-                prompt_parts.append(f"Assistant: {str(assistant_response)}")
-        prompt_parts.append("</conversation_history>")
-
-    if contexts:
-        prompt_parts.append("<context>")
-        prompt_parts.append(build_context_from_results(contexts))
-        prompt_parts.append("</context>")
-
-    prompt_parts.append(f"<user_query>{query}</user_query>")
-
-    return "\n".join(prompt_parts)
-
-
-def build_deep_research_prompt(
-    query: str,
-    repo_url: str,
-    repo_name: str,
-    repo_type: str,
-    language: str,
-    iteration: int,
-    total_iterations: int,
-    conversation_history: Optional[Dict] = None,
-) -> str:
-    """构建深度研究提示词"""
-    language_name = get_language_name(language)
-
-    if iteration == 1:
-        prompt_template = DEEP_RESEARCH_FIRST_ITERATION_PROMPT
-    elif iteration >= total_iterations:
-        prompt_template = DEEP_RESEARCH_FINAL_ITERATION_PROMPT
-    else:
-        prompt_template = DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT
-
-    system_prompt = prompt_template.format(
-        repo_type=repo_type,
-        repo_url=repo_url,
-        repo_name=repo_name,
-        language_name=language_name,
-        research_iteration=iteration,
-    )
-
-    prompt_parts = [f"<system>{system_prompt}</system>"]
-
-    if conversation_history:
-        prompt_parts.append("<conversation_history>")
-        for key, turn in conversation_history.items():
-            user_query = turn.get("user_query", {})
-            assistant_response = turn.get("assistant_response", {})
-            if isinstance(user_query, dict):
-                prompt_parts.append(f"User: {user_query.get('data', str(user_query))}")
-            else:
-                prompt_parts.append(f"User: {str(user_query)}")
-            if isinstance(assistant_response, dict):
-                prompt_parts.append(
-                    f"Assistant: {assistant_response.get('data', str(assistant_response))}"
-                )
-            else:
-                prompt_parts.append(f"Assistant: {str(assistant_response)}")
-        prompt_parts.append("</conversation_history>")
-
-    prompt_parts.append(f"<user_query>{query}</user_query>")
-
-    return "\n".join(prompt_parts)
 
 
 # ============================================================
@@ -166,11 +42,9 @@ async def handle_websocket_chat(websocket: WebSocket):
     接收 JSON 格式的请求，流式返回 LLM 响应（纯文本分片）。
     支持普通聊天和深度研究两种模式。
 
-    协议 (Phase 3):
-      - 接收: JSON 格式请求
-      - 发送: 纯文本分片（逐 token），兼容 deepwiki-open 前端
-      - 完成: 发送 "[DONE]" 标记
-      - 错误: 发送 "[ERROR: ...]" 标记
+    业务逻辑委托给:
+      - SimpleChatFlow — 普通聊天模式
+      - DeepResearchFlow — 深度研究模式
     """
     await websocket.accept()
     logger.info("WebSocket connection accepted")
@@ -179,47 +53,22 @@ async def handle_websocket_chat(websocket: WebSocket):
         # 接收请求数据
         request_data = await websocket.receive_json()
 
-        repo_url = request_data.get("repo_url", "")
-        repo_type = request_data.get("type", "github")
+        repo_url: str = request_data.get("repo_url", "")
+        repo_type: str = request_data.get("type", "github")
         token = request_data.get("token")
-        provider = request_data.get("provider", "dashscope")
+        provider: str = request_data.get("provider", "dashscope")
         model = request_data.get("model")
-        language = request_data.get("language", "en")
-        query = request_data.get("query", "")
-        file_path = request_data.get("filePath")
-        deep_research = request_data.get("deep_research", False)
-        research_iterations = request_data.get("research_iterations", 5)
-        excluded_dirs = request_data.get("excluded_dirs")
-        excluded_files = request_data.get("excluded_files")
-        included_dirs = request_data.get("included_dirs")
-        included_files = request_data.get("included_files")
+        language: str = request_data.get("language", "en")
+        query: str = request_data.get("query", "")
+        deep_research: bool = request_data.get("deep_research", False)
+        research_iterations: int = request_data.get("research_iterations", 5)
 
-        # 语言验证 — 使用 core.utils.language 验证
-        from core.utils.language import validate_language
+        # 语言验证
         language = validate_language(language, default="en")
 
         # 提取仓库名
         repo_url = repo_url.rstrip("/")
         repo_name = repo_url.split("/")[-1] if "/" in repo_url else repo_url
-
-        # 准备检索器
-        try:
-            db_manager = PgvectorDatabaseManager()
-
-            project_id = db_manager.prepare_database(
-                repo_url_or_path=repo_url,
-                repo_type=repo_type,
-                access_token=token,
-            )
-
-            retriever = PgvectorRetriever(
-                project_id=project_id,
-                retrieval_type="hybrid",
-                top_k=10,
-            )
-        except Exception as e:
-            logger.warning(f"Could not prepare retriever: {e}")
-            retriever = None
 
         # 处理深度研究模式
         if deep_research:
@@ -232,7 +81,6 @@ async def handle_websocket_chat(websocket: WebSocket):
                 language=language,
                 provider=provider,
                 model=model,
-                retriever=retriever,
                 iterations=research_iterations,
             )
         else:
@@ -246,7 +94,6 @@ async def handle_websocket_chat(websocket: WebSocket):
                 language=language,
                 provider=provider,
                 model=model,
-                retriever=retriever,
             )
 
     except WebSocketDisconnect:
@@ -273,36 +120,39 @@ async def _handle_simple_chat_ws(
     language: str,
     provider: str,
     model: Optional[str],
-    retriever: Optional[PgvectorRetriever],
 ):
-    """处理普通 WebSocket 聊天 — 纯文本分片推流"""
-    try:
-        # 检索相关文档
-        contexts = None
-        if retriever:
-            try:
-                contexts = retriever(query, k=10)
-                logger.info(f"Retrieved {len(contexts)} documents")
-            except Exception as e:
-                logger.warning(f"Retrieval error: {e}")
+    """
+    处理普通 WebSocket 聊天 — 委托给 SimpleChatFlow
 
-        # 构建提示词
-        prompt = build_simple_chat_prompt(
-            query=query,
+    SimpleChatFlow 负责:
+      1. 初始化 RAG 检索器
+      2. 构建 RAG 上下文
+      3. 构建 prompt（系统指令 + 上下文 + 用户问题）
+
+    API 层负责:
+      - WebSocket 纯文本分片推流
+      - 发送 [DONE] / [ERROR] 标记
+    """
+    try:
+        # 初始化 SimpleChatFlow
+        flow = SimpleChatFlow(
             repo_url=repo_url,
-            repo_name=repo_name,
-            repo_type=repo_type,
+            provider=provider,
+            model=model or "qwen-plus",
             language=language,
-            contexts=contexts,
+            use_database=True,
         )
 
-        # 构建消息
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": query},
-        ]
+        # 步骤 1: 初始化 RAG 检索器
+        flow._init_retriever(top_k=10)
 
-        # 流式调用 LLM — 纯文本分片
+        # 步骤 2: 构建 RAG 上下文
+        context = flow._build_context(query)
+
+        # 步骤 3: 构建 prompt
+        messages = flow._build_prompt(query, context)
+
+        # 步骤 4: 流式调用 LLM — 纯文本分片
         async for chunk in call_llm_stream_raw(
             provider=provider,
             model=model,
@@ -327,55 +177,52 @@ async def _handle_deep_research_ws(
     language: str,
     provider: str,
     model: Optional[str],
-    retriever: Optional[PgvectorRetriever],
     iterations: int = 5,
 ):
-    """处理深度研究 WebSocket 聊天 — 纯文本分片推流"""
+    """
+    处理深度研究 WebSocket 聊天 — 委托给 DeepResearchFlow
+
+    DeepResearchFlow 负责:
+      1. 初始化 RAG 检索器
+      2. 构建 RAG 上下文
+      3. 构建研究 prompt（根据迭代次数选择模板）
+
+    API 层负责:
+      - 迭代循环控制
+      - WebSocket 纯文本分片推流
+      - 发送迭代标记（ITERATION_START / ITERATION_DONE / DONE / ERROR）
+    """
     try:
-        # 使用简单的内存对话跟踪（替代 api.rag.Memory）
+        # 初始化 DeepResearchFlow
+        flow = DeepResearchFlow(
+            repo_url=repo_url,
+            provider=provider,
+            model=model or "qwen-plus",
+            language=language,
+            use_database=True,
+        )
+
+        # 初始化 RAG 检索器
+        flow._init_retriever(top_k=10)
+
+        # 使用简单的内存对话跟踪
         conversation_turns: List[Dict[str, str]] = []
 
         for i in range(1, iterations + 1):
-            # 检索相关文档
-            contexts = None
-            if retriever:
-                try:
-                    contexts = retriever(query, k=10)
-                except Exception as e:
-                    logger.warning(f"Research iteration {i} retrieval error: {e}")
+            # 构建 RAG 上下文
+            context = flow._build_context(query)
 
-            # 构建深度研究提示词
-            conversation_history = None
-            if conversation_turns:
-                conversation_history = {
-                    str(idx): {
-                        "user_query": {"data": turn["user"]},
-                        "assistant_response": {"data": turn["assistant"]},
-                    }
-                    for idx, turn in enumerate(conversation_turns)
-                }
-
-            prompt = build_deep_research_prompt(
+            # 构建研究 prompt
+            messages = flow._build_research_prompt(
                 query=query,
-                repo_url=repo_url,
-                repo_name=repo_name,
-                repo_type=repo_type,
-                language=language,
                 iteration=i,
-                total_iterations=iterations,
-                conversation_history=conversation_history,
+                context=context,
             )
 
-            # 构建消息
-            messages = [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": query},
-            ]
-
-            # 添加上下文
-            if contexts:
-                context_text = build_context_from_results(contexts)
-                messages.insert(1, {"role": "user", "content": f"Context:\n{context_text}"})
+            # 如果有对话历史，添加到 messages 中
+            for turn in conversation_turns:
+                messages.append({"role": "assistant", "content": turn["assistant"]})
+                messages.append({"role": "user", "content": "[DEEP RESEARCH] Continue the research"})
 
             # 发送迭代开始信号
             await websocket.send_text(f"[ITERATION_START:{i}]")
