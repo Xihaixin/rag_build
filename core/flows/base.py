@@ -7,28 +7,30 @@ base.py — 业务流公共基类
 
   1. 仓库信息解析（parse_repo_url）
   2. 配置加载（load_configs）
-  3. LLM 调用封装（_call_llm, _parse_sse_chunk）
+  3. LLM 调用封装（call_llm_and_collect, parse_sse_chunk）
   4. RAG 检索器初始化（_init_retriever）
   5. 项目查找与 project_id 解析
 
 依赖:
   - core.config — 统一配置加载
+  - core.utils.llm — call_llm_stream
+  - core.utils.sse — parse_sse_chunk, call_llm_and_collect
   - api.prompts — Prompt 模板
-  - api.simple_chat — call_llm_stream, get_language_name
+  - api.simple_chat — get_language_name
   - rag_optimizer.integration.deepwiki_adapter — PgvectorRetriever
   - rag_optimizer.db.repository — ProjectRepository
 """
 
-import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from core.config import (
     load_generator_config, load_embedder_config, load_lang_config,
 )
+from core.utils.llm import call_llm_stream
+from core.utils.sse import parse_sse_chunk, call_llm_and_collect
 from api.simple_chat import get_language_name as _get_language_name
-from api.simple_chat import call_llm_stream
 from rag_optimizer.integration.deepwiki_adapter import PgvectorRetriever
 from rag_optimizer.db.repository import ProjectRepository
 
@@ -139,74 +141,6 @@ def generate_file_url(file_path: str, repo_url: str, repo_type: str = "github") 
         return f"{repo_url.rstrip('/')}/src/main/{clean_path}"
     else:
         return f"{repo_url.rstrip('/')}/{clean_path}"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# SSE 解析
-# ══════════════════════════════════════════════════════════════════════════
-
-
-def parse_sse_chunk(chunk: str) -> Optional[str]:
-    """
-    解析 call_llm_stream 返回的 SSE 格式字符串，提取实际文本内容。
-
-    call_llm_stream 返回的格式为: data: {"content":"文本块"}\n\n
-    或错误时: data: {"error":"错误信息"}\n\n
-
-    参数:
-        chunk: SSE 格式的字符串块
-
-    返回:
-        提取的文本内容，如果是错误块则返回 None
-    """
-    if not chunk or not chunk.strip():
-        return None
-
-    text = chunk.strip()
-    if text.startswith("data: "):
-        text = text[6:]
-
-    try:
-        data = json.loads(text)
-        if "error" in data:
-            logger.warning(f"LLM 返回错误: {data['error']}")
-            return None
-        return data.get("content", "")
-    except json.JSONDecodeError:
-        return chunk
-
-
-async def call_llm_and_collect(
-    provider: str,
-    model: Optional[str],
-    messages: List[Dict[str, str]],
-) -> str:
-    """
-    调用 call_llm_stream 并自动解析 SSE 格式，返回完整的纯文本响应。
-
-    这是 call_llm_stream 的便捷封装，自动处理 SSE 解析，
-    避免在每个调用点重复编写 SSE 解析逻辑。
-
-    参数:
-        provider: LLM 提供者 (dashscope, google, openai, openrouter, ollama)
-        model: 模型名称
-        messages: 消息列表
-
-    返回:
-        完整的纯文本响应（不含 SSE 格式标记）
-    """
-    full_response = ""
-    try:
-        async for chunk in call_llm_stream(provider, model, messages):
-            if chunk:
-                text = parse_sse_chunk(chunk)
-                if text:
-                    full_response += text
-    except Exception as e:
-        logger.error(f"LLM 调用失败: {e}")
-        raise
-
-    return full_response
 
 
 # ══════════════════════════════════════════════════════════════════════════

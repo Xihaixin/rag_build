@@ -3,6 +3,9 @@
 
 替代原始 deepwiki-open 的 simple_chat.py，底层使用 rag_optimizer 的
 PgvectorRetriever 进行检索，支持多种 LLM 提供者。
+
+注意: call_llm_stream 及所有 _call_*_stream 函数已迁移至
+core.utils.llm，此处仅做重导出以保持向后兼容。
 """
 
 import json
@@ -13,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from api.config import configs, get_model_config
+from api.config import configs
 from api.prompts import (
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
     DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
@@ -21,6 +24,14 @@ from api.prompts import (
     SIMPLE_CHAT_SYSTEM_PROMPT,
 )
 from api.rag import Memory
+from core.utils.llm import (
+    call_llm_stream,
+    _call_dashscope_stream,
+    _call_google_stream,
+    _call_openai_stream,
+    _call_openrouter_stream,
+    _call_ollama_stream,
+)
 from rag_optimizer.integration.deepwiki_adapter import (
     PgvectorRetriever,
     PgvectorDatabaseManager,
@@ -181,216 +192,6 @@ def build_deep_research_prompt(
     prompt_parts.append(f"<user_query>{query}</user_query>")
 
     return "\n".join(prompt_parts)
-
-
-# ============================================================
-# LLM 调用函数（HTTP SSE 版本）
-# ============================================================
-
-
-async def call_llm_stream(
-    provider: str,
-    model: Optional[str],
-    messages: List[Dict[str, str]],
-) -> AsyncGenerator[str, None]:
-    """
-    调用 LLM 并通过 SSE 流式返回结果
-
-    支持多个提供者：dashscope, google, openai, openrouter, ollama
-    """
-    try:
-        model_config = get_model_config(provider=provider, model=model)
-        model_kwargs = model_config.get("model_kwargs", {})
-        actual_model = model_kwargs.get("model", model or "qwen-plus")
-
-        if provider == "dashscope":
-            async for chunk in _call_dashscope_stream(actual_model, messages, model_kwargs):
-                yield chunk
-        elif provider == "google":
-            async for chunk in _call_google_stream(actual_model, messages, model_kwargs):
-                yield chunk
-        elif provider == "openai":
-            async for chunk in _call_openai_stream(actual_model, messages, model_kwargs):
-                yield chunk
-        elif provider == "openrouter":
-            async for chunk in _call_openrouter_stream(actual_model, messages, model_kwargs):
-                yield chunk
-        elif provider == "ollama":
-            async for chunk in _call_ollama_stream(actual_model, messages, model_kwargs):
-                yield chunk
-        else:
-            async for chunk in _call_dashscope_stream(actual_model, messages, model_kwargs):
-                yield chunk
-
-    except Exception as e:
-        logger.error(f"LLM call error: {e}")
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-
-async def _call_dashscope_stream(
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-) -> AsyncGenerator[str, None]:
-    """调用 DashScope 流式 API"""
-    from openai import AsyncOpenAI
-    from rag_optimizer.config.settings import settings
-
-    api_key = settings.embedding.dashscope_api_key
-    if not api_key:
-        yield f"data: {json.dumps({'error': 'DASHSCOPE_API_KEY not configured'})}\n\n"
-        return
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=settings.embedding.dashscope_base_url,
-    )
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
-
-
-async def _call_google_stream(
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-) -> AsyncGenerator[str, None]:
-    """调用 Google Generative AI"""
-    import os
-    import google.generativeai as genai
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        yield f"data: {json.dumps({'error': 'GOOGLE_API_KEY not configured'})}\n\n"
-        return
-
-    genai.configure(api_key=api_key)
-    client = genai.GenerativeModel(model)
-
-    chat_messages = []
-    for msg in messages:
-        if msg["role"] != "system":
-            chat_messages.append({"role": msg["role"], "parts": [msg["content"]]})
-
-    chat = client.start_chat(history=chat_messages[:-1] if len(chat_messages) > 1 else [])
-    response = await chat.send_message_async(
-        chat_messages[-1]["parts"][0] if chat_messages else "",
-    )
-    yield f"data: {json.dumps({'content': response.text})}\n\n"
-
-
-async def _call_openai_stream(
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-) -> AsyncGenerator[str, None]:
-    """调用 OpenAI 流式 API"""
-    from openai import AsyncOpenAI
-    import os
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        yield f"data: {json.dumps({'error': 'OPENAI_API_KEY not configured'})}\n\n"
-        return
-
-    client = AsyncOpenAI(api_key=api_key)
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
-
-
-async def _call_openrouter_stream(
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-) -> AsyncGenerator[str, None]:
-    """调用 OpenRouter 流式 API"""
-    from openai import AsyncOpenAI
-    import os
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        yield f"data: {json.dumps({'error': 'OPENROUTER_API_KEY not configured'})}\n\n"
-        return
-
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
-
-    temperature = model_kwargs.get("temperature", 0.7)
-    top_p = model_kwargs.get("top_p", 0.8)
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        top_p=top_p,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-            yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
-
-
-async def _call_ollama_stream(
-    model: str,
-    messages: List[Dict[str, str]],
-    model_kwargs: Dict[str, Any],
-) -> AsyncGenerator[str, None]:
-    """调用 Ollama 流式 API"""
-    import httpx
-    import os
-
-    ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    options = model_kwargs.get("options", {})
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "options": {
-            "temperature": options.get("temperature", 0.7),
-            "top_p": options.get("top_p", 0.8),
-            "num_ctx": options.get("num_ctx", 32000),
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", f"{ollama_base_url}/api/chat", json=payload) as response:
-            async for line in response.aiter_lines():
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        if "message" in data and "content" in data["message"]:
-                            yield f"data: {json.dumps({'content': data['message']['content']})}\n\n"
-                    except json.JSONDecodeError:
-                        continue
 
 
 # ============================================================
