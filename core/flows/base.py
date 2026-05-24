@@ -12,9 +12,9 @@ base.py — 业务流公共基类
   5. 项目查找与 project_id 解析
 
 依赖:
-  - api.config — 配置加载
+  - core.config — 统一配置加载
   - api.prompts — Prompt 模板
-  - api.simple_chat — call_llm_stream
+  - api.simple_chat — call_llm_stream, get_language_name
   - rag_optimizer.integration.deepwiki_adapter — PgvectorRetriever
   - rag_optimizer.db.repository — ProjectRepository
 """
@@ -24,7 +24,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from api.config import (
+from core.config import (
     load_generator_config, load_embedder_config, load_lang_config,
 )
 from api.simple_chat import get_language_name as _get_language_name
