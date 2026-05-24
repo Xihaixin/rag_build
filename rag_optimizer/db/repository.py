@@ -374,3 +374,94 @@ class PipelineLogRepository:
              input_count, output_count, duration_ms,
              error_message, json.dumps(parameters) if parameters else None)
         )
+
+
+# ============================================================
+# Wiki 页面 Repository
+# ============================================================
+
+class WikiPageRepository:
+    """Wiki 页面数据访问"""
+
+    @staticmethod
+    def upsert(project_id: str, page_slug: str, title: str,
+               content_md: str, language: str = "zh",
+               is_comprehensive: bool = True,
+               provider: Optional[str] = None,
+               model: Optional[str] = None,
+               source_chunks: Optional[List[Dict[str, Any]]] = None,
+               version: int = 1) -> str:
+        """
+        插入或更新 Wiki 页面。
+
+        使用 (project_id, page_slug, language) 唯一约束进行 UPSERT。
+        对应 SQL: wiki_pages 表的 UNIQUE (project_id, page_slug, language)。
+
+        Args:
+            project_id: 项目 ID
+            page_slug: 页面唯一标识（kebab-case）
+            title: 页面标题
+            content_md: Markdown 内容
+            language: 语言代码
+            is_comprehensive: 是否为综合模式
+            provider: LLM 提供者
+            model: LLM 模型
+            source_chunks: 来源分块列表
+            version: 版本号
+
+        Returns:
+            str: 页面 ID
+        """
+        result = sync_conn.execute(
+            """INSERT INTO wiki_pages
+               (project_id, page_slug, title, content_md, language,
+                is_comprehensive, provider, model, source_chunks, version)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+               ON CONFLICT (project_id, page_slug, language) DO UPDATE SET
+               title = EXCLUDED.title,
+               content_md = EXCLUDED.content_md,
+               is_comprehensive = EXCLUDED.is_comprehensive,
+               provider = EXCLUDED.provider,
+               model = EXCLUDED.model,
+               source_chunks = EXCLUDED.source_chunks,
+               version = wiki_pages.version + 1,
+               updated_at = NOW()
+               RETURNING id""",
+            (project_id, page_slug, title, content_md, language,
+             is_comprehensive, provider, model,
+             json.dumps(source_chunks) if source_chunks else None,
+             version)
+        )
+        return str(result[0]["id"])
+
+    @staticmethod
+    def get_by_project(project_id: str, language: Optional[str] = None) -> List[dict]:
+        """获取项目的所有 Wiki 页面"""
+        if language:
+            result = sync_conn.execute(
+                "SELECT * FROM wiki_pages WHERE project_id = %s AND language = %s ORDER BY created_at",
+                (project_id, language)
+            )
+        else:
+            result = sync_conn.execute(
+                "SELECT * FROM wiki_pages WHERE project_id = %s ORDER BY created_at",
+                (project_id,)
+            )
+        return [dict(r) for r in result] if result else []
+
+    @staticmethod
+    def get_by_slug(project_id: str, page_slug: str, language: str = "zh") -> Optional[dict]:
+        """根据 slug 获取 Wiki 页面"""
+        result = sync_conn.execute(
+            "SELECT * FROM wiki_pages WHERE project_id = %s AND page_slug = %s AND language = %s",
+            (project_id, page_slug, language)
+        )
+        return dict(result[0]) if result else None
+
+    @staticmethod
+    def delete_by_project(project_id: str):
+        """删除项目的所有 Wiki 页面"""
+        sync_conn.execute(
+            "DELETE FROM wiki_pages WHERE project_id = %s",
+            (project_id,)
+        )

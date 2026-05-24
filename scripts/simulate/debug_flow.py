@@ -18,6 +18,11 @@ debug_flow.py — DeepWiki-open 业务逻辑流独立调试程序
      - 自动检测研究是否完成
      - 提取研究阶段（计划/更新/结论）
 
+  4. 数据摄取 (DataIngestionFlow)
+     - 下载仓库到 DATA_SOURCE/repos/
+     - 读取文档 → 分块 → 嵌入 → 存储到 PostgreSQL + pgvector
+     - 作为 wiki/chat/research 的前置步骤
+
 设计目标：
   - 不是 API，不是 FastAPI 应用
   - 直接导入项目已有的后端组件（数据管理器、RAG 检索器、prompt 模板）
@@ -26,9 +31,20 @@ debug_flow.py — DeepWiki-open 业务逻辑流独立调试程序
   - 适合在 VS Code 中设置断点调试，理解完整业务逻辑流
 
 用法：
+  # 数据摄取（前置步骤：将仓库数据存入数据库）
+  python scripts/simulate/debug_flow.py --mode ingest --repo-url https://github.com/user/repo
+
+  # Wiki 生成
   python scripts/simulate/debug_flow.py --mode wiki --repo-url https://github.com/user/repo
+
+  # Q&A 聊天
   python scripts/simulate/debug_flow.py --mode chat --repo-url https://github.com/user/repo --query "如何配置项目？"
+
+  # 深度研究
   python scripts/simulate/debug_flow.py --mode research --repo-url https://github.com/user/repo --query "架构设计原理"
+
+  # 跳过数据库，使用样本数据
+  python scripts/simulate/debug_flow.py --mode wiki --repo-url https://github.com/user/repo --no-db
 
 依赖：
   - 项目后端组件（api/, rag_optimizer/）
@@ -97,6 +113,13 @@ from rag_optimizer.integration.deepwiki_adapter import (
 
 # LLM 调用
 from api.simple_chat import call_llm_stream
+
+# ── 数据摄取 ──────────────────────────────────────────────────────────────
+from scripts.simulate.data_ingestion import (
+    DataIngestor, run_ingestion, check_project_exists,
+    DATA_SOURCE_ROOT, REPOS_DIR,
+)
+from rag_optimizer.db.repository import WikiPageRepository
 
 # ── 测试数据 ──────────────────────────────────────────────────────────────
 from scripts.simulate.fixtures import (
@@ -421,7 +444,8 @@ class WikiGenerationFlow:
           - 本地: GET /local_repo/structure?path=...
         
         本实现支持两种模式:
-          1. use_database=True  → 从 PostgreSQL 数据库查询已有数据
+          1. use_database=True  → 从 PostgreSQL 数据库查询已有数据；
+             如果数据库无数据，自动触发 DataIngestor 摄取管道
           2. use_database=False → 使用 fixtures 中的样本数据
         """
         logger.info("\n" + "=" * 60)
@@ -436,6 +460,42 @@ class WikiGenerationFlow:
                 logger.info(f"✓ 从数据库获取文件树 ({len(self.file_tree)} 字符)")
                 logger.info(f"✓ 从数据库获取 README ({len(self.readme)} 字符)")
                 return self.file_tree, self.readme
+            
+            # ── 数据库无数据，自动触发数据摄取管道 ──
+            logger.warning("数据库中无此项目数据，自动触发数据摄取 (DataIngestor)...")
+            logger.info("=" * 50)
+            
+            ingestor = DataIngestor(
+                repo_url=self.repo_url,
+                repo_type=self.repo_type,
+                access_token=None,
+                local_path=None,
+            )
+            project_id = ingestor.run()
+            
+            if not project_id:
+                logger.error("❌ 数据摄取失败，无法继续 Wiki 生成")
+                raise RuntimeError(
+                    f"数据摄取失败 (repo_url={self.repo_url})。"
+                    f"请先手动运行: python scripts/simulate/debug_flow.py "
+                    f"--mode ingest --repo-url {self.repo_url}"
+                )
+            
+            self.project_id = project_id
+            logger.info(f"✓ 数据摄取完成 (project_id={project_id})")
+            logger.info("=" * 50)
+            
+            # 重新从数据库获取仓库结构
+            logger.info("重新从数据库获取仓库结构...")
+            result = self._fetch_from_database()
+            if result is not None:
+                self.file_tree, self.readme = result
+                logger.info(f"✓ 从数据库获取文件树 ({len(self.file_tree)} 字符)")
+                logger.info(f"✓ 从数据库获取 README ({len(self.readme)} 字符)")
+                return self.file_tree, self.readme
+            else:
+                logger.error("❌ 数据摄取后仍无法从数据库获取仓库结构")
+                raise RuntimeError("数据摄取后数据库查询仍然失败")
         
         # 回退到 fixtures 样本数据
         logger.info("使用 fixtures 样本数据...")
@@ -934,25 +994,169 @@ Return ONLY valid XML with this exact structure:
         
         return full_content
     
+    def _init_retriever(self) -> Optional[PgvectorRetriever]:
+        """
+        初始化 RAG 检索器（复用 SimpleChatFlow 的模式）。
+        
+        使用项目中已有的 PgvectorRetriever 进行混合检索。
+        对应原始项目 websocket_wiki.py 中 request_rag.prepare_retriever() 的逻辑。
+        """
+        if not self.use_database:
+            logger.info("  跳过 RAG 检索器初始化（use_database=False）")
+            return None
+        
+        if not self.project_id:
+            logger.warning("  project_id 为空，无法初始化检索器")
+            return None
+        
+        try:
+            retriever = PgvectorRetriever(
+                project_id=self.project_id,
+                retrieval_type="hybrid",
+                top_k=10,
+            )
+            logger.info(f"  ✓ RAG 检索器已初始化 (project_id={self.project_id})")
+            return retriever
+        except Exception as e:
+            logger.warning(f"  初始化 RAG 检索器失败: {e}")
+            return None
+    
+    def _fetch_file_contents(self, page: WikiPage) -> Dict[str, str]:
+        """
+        从数据库获取页面相关文件的完整内容。
+        
+        对应原始项目 websocket_wiki.py 中 get_file_content() 的逻辑（lines 401-409）：
+          file_content = get_file_content(request.repo_url, request.filePath, ...)
+        
+        使用项目中已有的 DocumentRepository.get_by_project() 获取所有文档，
+        然后按 file_path 匹配 page.filePaths 中的路径，提取文件内容。
+        
+        Returns:
+            Dict[str, str] — file_path → content 的映射
+        """
+        if not self.use_database or not self.project_id:
+            return {}
+        
+        try:
+            documents = DocumentRepository.get_by_project(self.project_id)
+            if not documents:
+                logger.info("  数据库中没有文档记录")
+                return {}
+            
+            # 建立 file_path → content 索引
+            doc_map: Dict[str, str] = {}
+            for doc in documents:
+                fp = doc.get("file_path", "")
+                content = doc.get("content", "")
+                if fp and content:
+                    doc_map[fp] = content
+            
+            # 匹配页面相关文件
+            file_contents: Dict[str, str] = {}
+            for fp in page.filePaths:
+                # 精确匹配
+                if fp in doc_map:
+                    file_contents[fp] = doc_map[fp]
+                    logger.info(f"  ✓ 获取文件内容: {fp} ({len(doc_map[fp])} 字符)")
+                else:
+                    # 模糊匹配（路径后缀或包含）
+                    matched = False
+                    for db_fp, content in doc_map.items():
+                        if db_fp.endswith(fp) or fp in db_fp:
+                            file_contents[db_fp] = content
+                            logger.info(f"  ✓ 模糊匹配文件内容: {db_fp} ({len(content)} 字符)")
+                            matched = True
+                            break
+                    if not matched:
+                        logger.info(f"  - 未找到文件: {fp}")
+            
+            return file_contents
+            
+        except Exception as e:
+            logger.warning(f"  获取文件内容失败: {e}")
+            return {}
+    
     def _build_page_prompt(self, page: WikiPage) -> str:
         """
         构建单个页面的生成 prompt。
         
-        对应前端 page.tsx 中 generatePageContent() 里的 prompt 构建逻辑（lines 419-526）：
-          - 包含页面标题、文件路径列表
-          - 指定语言
-          - 要求使用 Mermaid 图表
-          - 要求使用表格
-          - 要求代码引用
-          - 要求引用链接
+        对应原始项目 websocket_wiki.py 中 handle_websocket_chat() 的 prompt 构建逻辑（lines 418-438）。
+        
+        原始项目的 prompt 结构：
+          /no_think {system_prompt}
+          <conversation_history>...</conversation_history>
+          <currentFileContent path="src/rag.py">{完整文件代码}</currentFileContent>
+          <START_OF_CONTEXT>
+          ## File Path: src/rag.py
+          {RAG 检索到的代码片段}
+          <END_OF_CONTEXT>
+          <query>{用户问题}</query>
+          Assistant:
+        
+        本实现使用项目中已有的组件：
+          1. DocumentRepository — 获取文件完整内容 → <currentFileContent>
+          2. PgvectorRetriever — RAG 检索相关代码片段 → <START_OF_CONTEXT>
         """
-        # 构建文件路径列表（带 URL）
+        # ── 1. 获取文件完整内容（对应原始项目的 get_file_content） ──────────
+        file_contents = self._fetch_file_contents(page)
+        
+        file_content_blocks = ""
+        for fp, content in file_contents.items():
+            file_content_blocks += (
+                f"<currentFileContent path=\"{fp}\">\n"
+                f"{content}\n"
+                f"</currentFileContent>\n\n"
+            )
+        
+        # ── 2. RAG 检索相关代码片段（对应原始项目的 request_rag(rag_query)） ──
+        context_text = ""
+        if self.use_database and self.project_id:
+            try:
+                retriever = self._init_retriever()
+                if retriever:
+                    # 使用页面标题和文件路径作为 RAG 查询
+                    rag_query = f"Contexts related to {page.title}: {', '.join(page.filePaths)}"
+                    logger.info(f"  RAG 查询: {rag_query}")
+                    
+                    # 使用 PgvectorRetriever.search() 原生接口（返回 (List[RetrievalResult], RetrievalStats)）
+                    results, stats = retriever.search(rag_query, top_k=10)
+                    
+                    if results:
+                        # 按 file_path 分组（对应原始项目 lines 216-234）
+                        docs_by_file: Dict[str, List] = {}
+                        for r in results:
+                            file_path = getattr(r, "file_path", "unknown") or "unknown"
+                            if file_path not in docs_by_file:
+                                docs_by_file[file_path] = []
+                            docs_by_file[file_path].append(r)
+                        
+                        # 格式化为 <START_OF_CONTEXT> 块
+                        context_parts = []
+                        for file_path, docs in docs_by_file.items():
+                            header = f"## File Path: {file_path}\n\n"
+                            contents = []
+                            for d in docs:
+                                content = getattr(d, "content", "") or getattr(d, "text", "") or ""
+                                if content:
+                                    contents.append(content)
+                            if contents:
+                                context_parts.append(f"{header}{chr(10).join(contents)}")
+                        
+                        if context_parts:
+                            context_text = "\n\n" + "-" * 10 + "\n\n".join(context_parts)
+                            logger.info(f"  ✓ RAG 检索到 {len(results)} 个结果，来自 {len(docs_by_file)} 个文件")
+                    else:
+                        logger.info("  RAG 检索未返回结果")
+            except Exception as e:
+                logger.warning(f"  RAG 检索失败: {e}")
+        
+        # ── 3. 构建文件路径列表（带 URL） ──────────────────────────────────
         file_paths_str = ""
         for fp in page.filePaths:
             url = generate_file_url(fp, self.repo_url, self.repo_type)
             file_paths_str += f"  - {fp}\n    URL: {url}\n"
         
-        # 构建相关页面列表
+        # ── 4. 构建相关页面列表 ────────────────────────────────────────────
         related_str = ""
         if self.wiki_structure:
             for rp_id in page.relatedPages:
@@ -963,7 +1167,8 @@ Return ONLY valid XML with this exact structure:
                         break
                 related_str += f"  - [{rp_title}]({rp_id})\n"
         
-        prompt = (
+        # ── 5. 组装最终 prompt（匹配原始项目的结构 lines 418-438） ──────────
+        system_prompt = (
             f"You are a technical documentation writer. Generate a comprehensive wiki page for the following topic.\n\n"
             f"## Project\n"
             f"- Repository: {self.repo_url}\n"
@@ -984,6 +1189,24 @@ Return ONLY valid XML with this exact structure:
             f"6. Use proper markdown formatting\n"
         )
         
+        # 构建最终 prompt（匹配原始项目的结构）
+        prompt = f"/no_think {system_prompt}\n\n"
+        
+        # 注入文件完整内容（对应原始项目的 <currentFileContent>）
+        if file_content_blocks:
+            prompt += file_content_blocks
+        
+        # 注入 RAG 上下文（对应原始项目的 <START_OF_CONTEXT>）
+        CONTEXT_START = "<START_OF_CONTEXT>"
+        CONTEXT_END = "<END_OF_CONTEXT>"
+        if context_text.strip():
+            prompt += f"{CONTEXT_START}\n{context_text}\n{CONTEXT_END}\n\n"
+        else:
+            prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
+        
+        # 添加查询
+        prompt += f"<query>\nGenerate the wiki page for: {page.title}\n</query>\n\nAssistant: "
+        
         return prompt
     
     def _clean_markdown_delimiters(self, content: str) -> str:
@@ -998,7 +1221,66 @@ Return ONLY valid XML with this exact structure:
         content = re.sub(r'\n```\s*$', '', content)
         return content.strip()
     
-    # ── 步骤 4: 打印结果摘要 ──────────────────────────────────────────────
+    # ── 步骤 4: 保存到数据库 ──────────────────────────────────────────────
+    
+    def _save_to_database(self) -> int:
+        """
+        将生成的 Wiki 页面持久化到 wiki_pages 表。
+        
+        使用 WikiPageRepository.upsert() 写入每条页面记录，
+        (project_id, page_slug, language) 唯一约束确保幂等性。
+        
+        Returns:
+            int: 保存的页面数
+        """
+        if not self.use_database:
+            logger.info("跳过数据库保存（use_database=False）")
+            return 0
+        
+        if not self.project_id:
+            logger.warning("project_id 为空，无法保存 Wiki 页面到数据库")
+            return 0
+        
+        if not self.generated_pages:
+            logger.warning("没有已生成的页面，跳过数据库保存")
+            return 0
+        
+        if not self.wiki_structure or not self.wiki_structure.pages:
+            logger.warning("wiki_structure 为空，跳过数据库保存")
+            return 0
+        
+        saved_count = 0
+        logger.info("\n" + "=" * 60)
+        logger.info("步骤 4: 保存 Wiki 页面到数据库 (_save_to_database)")
+        logger.info("=" * 60)
+        
+        for page in self.wiki_structure.pages:
+            content_md = self.generated_pages.get(page.id)
+            if not content_md:
+                logger.warning(f"  跳过页面 '{page.title}'（无内容）")
+                continue
+            
+            try:
+                page_id = WikiPageRepository.upsert(
+                    project_id=self.project_id,
+                    page_slug=page.id,
+                    title=page.title,
+                    content_md=content_md,
+                    language=self.language,
+                    is_comprehensive=self.comprehensive,
+                    provider=self.provider,
+                    model=self.model,
+                    source_chunks=None,  # 暂不记录来源分块
+                )
+                saved_count += 1
+                logger.info(f"  ✓ 已保存: {page.title} ({page.id}) → id={page_id}")
+            except Exception as e:
+                logger.error(f"  ✗ 保存失败: {page.title} ({page.id}): {e}")
+        
+        logger.info(f"\n✓ 共保存 {saved_count}/{len(self.wiki_structure.pages)} 个页面到 wiki_pages 表")
+        return saved_count
+    
+    # ── 步骤 5: 打印结果摘要 ──────────────────────────────────────────────
     
     def print_summary(self) -> None:
         """打印 Wiki 生成结果摘要"""
@@ -1657,12 +1939,47 @@ class DeepResearchFlow:
 # Part 6: 主入口
 # ══════════════════════════════════════════════════════════════════════════
 
+async def run_ingest_mode(args: Any) -> None:
+    """运行数据摄取模式"""
+    logger.info("=" * 70)
+    logger.info("模式: 数据摄取 (代码仓库 → PostgreSQL + pgvector)")
+    logger.info("=" * 70)
+
+    # 检查项目是否已存在
+    existing = check_project_exists(args.repo_url)
+    if existing:
+        logger.info(f"项目已在数据库中 (id={existing})，将重新摄取")
+
+    # 执行数据摄取
+    ingestor = DataIngestor(
+        repo_url=args.repo_url,
+        repo_type=args.repo_type or "github",
+        access_token=args.token,
+        local_path=args.local_path,
+    )
+    project_id = ingestor.run()
+
+    if project_id:
+        logger.info(f"\n✅ 数据摄取成功! project_id={project_id}")
+        logger.info(f"现在可以运行其他模式使用此项目数据:")
+        logger.info(f"  python scripts/simulate/debug_flow.py --mode wiki --repo-url {args.repo_url}")
+        logger.info(f"  python scripts/simulate/debug_flow.py --mode chat --repo-url {args.repo_url} --query '...'")
+        logger.info(f"  python scripts/simulate/debug_flow.py --mode research --repo-url {args.repo_url} --query '...'")
+    else:
+        logger.error("\n❌ 数据摄取失败")
+
+
 async def run_wiki_mode(args: Any) -> None:
     """运行 Wiki 生成模式"""
     logger.info("=" * 70)
     logger.info("模式: Wiki 文档生成")
     logger.info("=" * 70)
     
+    # ── 初始化 Wiki 生成流 ────────────────────────────────────────────────
+    # WikiGenerationFlow.fetch_repository_structure() 内部会自动处理：
+    #   1. use_database=True  → 尝试从数据库获取数据
+    #   2. 数据库无数据       → 自动触发 DataIngestor 摄取管道
+    #   3. 摄取完成           → 重新从数据库获取
     flow = WikiGenerationFlow(
         repo_url=args.repo_url,
         provider=args.provider,
@@ -1672,7 +1989,7 @@ async def run_wiki_mode(args: Any) -> None:
         use_database=not args.no_db,
     )
     
-    # 步骤 1: 获取仓库结构
+    # 步骤 1: 获取仓库结构（内部自动处理数据摄取）
     flow.fetch_repository_structure()
     
     # 步骤 2: 确定 Wiki 结构
@@ -1681,7 +1998,11 @@ async def run_wiki_mode(args: Any) -> None:
     # 步骤 3: 生成所有页面
     await flow._generate_all_pages()
     
-    # 打印摘要
+    # 步骤 4: 保存到数据库（wiki_pages 表）
+    if not args.no_db:
+        flow._save_to_database()
+    
+    # 步骤 5: 打印摘要
     flow.print_summary()
 
 
@@ -1736,12 +2057,15 @@ async def run_research_mode(args: Any) -> None:
 def parse_args() -> Any:
     """解析命令行参数"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="DeepWiki-open 业务逻辑流独立调试程序",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 数据摄取（前置步骤：将仓库数据存入数据库）
+  python scripts/simulate/debug_flow.py --mode ingest --repo-url https://github.com/user/repo
+
   # Wiki 生成
   python scripts/simulate/debug_flow.py --mode wiki --repo-url https://github.com/user/repo
   
@@ -1755,62 +2079,85 @@ def parse_args() -> Any:
   python scripts/simulate/debug_flow.py --mode wiki --repo-url https://github.com/user/repo --no-db
         """,
     )
-    
+
     parser.add_argument(
         "--mode", "-m",
         type=str,
-        choices=["wiki", "chat", "research"],
+        choices=["ingest", "wiki", "chat", "research"],
         default="wiki",
-        help="运行模式: wiki (Wiki生成), chat (Q&A聊天), research (深度研究)",
+        help="运行模式: ingest (数据摄取), wiki (Wiki生成), chat (Q&A聊天), research (深度研究)",
     )
-    
+
     parser.add_argument(
         "--repo-url", "-u",
         type=str,
         default="https://github.com/Xihaixin/MathModelAgent",
         help="仓库 URL",
     )
-    
+
+    parser.add_argument(
+        "--repo-type",
+        type=str,
+        default=None,
+        choices=["github", "gitlab", "bitbucket", "gitee"],
+        help="仓库类型（仅 ingest 模式）",
+    )
+
     parser.add_argument(
         "--query", "-q",
         type=str,
         default="这个项目的主要功能是什么？",
         help="查询问题（chat/research 模式）",
     )
-    
+
     parser.add_argument(
         "--provider", "-p",
         type=str,
         default="dashscope",
         help="LLM 提供者 (google, openai, dashscope, ollama 等)",
     )
-    
+
     parser.add_argument(
         "--model",
         type=str,
         default="qwen-plus",
         help="LLM 模型名称",
     )
-    
+
     parser.add_argument(
         "--language", "-l",
         type=str,
         default="zh",
         help="语言代码 (zh, en 等)",
     )
-    
+
     parser.add_argument(
         "--concise", "-c",
         action="store_true",
         help="使用简洁模式（仅 wiki 模式）",
     )
-    
+
     parser.add_argument(
         "--no-db",
         action="store_true",
         help="不使用数据库，使用 fixtures 样本数据",
     )
-    
+
+    # ── 数据摄取相关参数 ──────────────────────────────────────────────
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="Git 访问令牌（仅 ingest 模式）",
+    )
+
+    parser.add_argument(
+        "--local-path",
+        type=str,
+        default=None,
+        help="本地仓库路径（仅 ingest 模式，如果已克隆）",
+    )
+
     return parser.parse_args()
 
 
@@ -1830,7 +2177,9 @@ async def main() -> None:
     logger.info(f"使用数据库: {not args.no_db}")
     logger.info("")
     
-    if args.mode == "wiki":
+    if args.mode == "ingest":
+        await run_ingest_mode(args)
+    elif args.mode == "wiki":
         await run_wiki_mode(args)
     elif args.mode == "chat":
         await run_chat_mode(args)
