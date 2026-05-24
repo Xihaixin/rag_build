@@ -6,15 +6,14 @@ sse.py — SSE 解析与聚合工具
 用于处理 LLM 流式响应。
 
 依赖:
-  - core.config — 配置加载（间接）
-  - api.simple_chat — call_llm_stream（待后续迁移后改为 core.utils.llm）
+  - core.utils.llm — call_llm_stream
 """
 
 import json
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from api.simple_chat import call_llm_stream
+from core.utils.llm import call_llm_stream
 
 logger = logging.getLogger("core.utils.sse")
 
