@@ -178,7 +178,9 @@ class DeepResearchFlow(BaseFlow):
           - 中间轮: DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT（研究更新）
           - 最终轮: DEEP_RESEARCH_FINAL_ITERATION_PROMPT（最终结论）
 
-        对应 api/prompts.py 中的三个模板。
+        注意：模板中的占位符为 {repo_type}, {repo_url}, {repo_name},
+        {language_name}, {research_iteration}（仅中间迭代）。
+        上下文和查询作为用户消息内容拼接，而非通过 .format() 传入。
         """
         messages = []
 
@@ -199,21 +201,25 @@ class DeepResearchFlow(BaseFlow):
         else:
             prompt_template = DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT
 
-        # 构建研究 prompt
+        # 构建研究 prompt — 只传入模板中实际存在的占位符
+        prompt_kwargs: Dict[str, Any] = {
+            "repo_type": self.repo_type,
+            "repo_url": self.repo_url,
+            "repo_name": self.repo,
+            "language_name": self.language_name,
+        }
+        # 中间迭代模板有 {research_iteration} 占位符
+        if iteration > 1 and iteration < self.MAX_ITERATIONS:
+            prompt_kwargs["research_iteration"] = str(iteration)
+
+        research_prompt = prompt_template.format(**prompt_kwargs)
+
+        # 拼接上下文和用户查询
         if context:
-            research_prompt = prompt_template.format(
-                query=query,
-                contexts=context,
-                iteration=iteration,
-                language=self.language_name,
+            research_prompt += (
+                f"\n\n<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n\n"
             )
-        else:
-            research_prompt = prompt_template.format(
-                query=query,
-                contexts="(无相关上下文)",
-                iteration=iteration,
-                language=self.language_name,
-            )
+        research_prompt += f"\n<query>\n{query}\n</query>"
 
         messages.append({"role": "user", "content": research_prompt})
         return messages

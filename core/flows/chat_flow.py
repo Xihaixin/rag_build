@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
 from core.models import Message
-from core.prompts.rag import SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
+from core.prompts.rag import SIMPLE_CHAT_SYSTEM_PROMPT, render_rag_template
 from core.rag_engine import RAGEngine
 
 logger = logging.getLogger("core.flows.chat")
@@ -161,7 +161,8 @@ class SimpleChatFlow(BaseFlow):
           3. RAG 上下文
           4. 用户问题
 
-        对应 api/prompts.py 中的 RAG_TEMPLATE 模板。
+        使用 render_rag_template() 通过 Jinja2 渲染 RAG_TEMPLATE，
+        保留模板的 Jinja2 语法以兼容未来 adalflow 重构。
         """
         messages = []
 
@@ -181,12 +182,21 @@ class SimpleChatFlow(BaseFlow):
 
         # 3. RAG 上下文 + 用户问题
         if context:
-            user_prompt = RAG_TEMPLATE.format(
+            # 使用 Jinja2 渲染 RAG_TEMPLATE
+            user_prompt = render_rag_template(
                 system_prompt=system_prompt,
-                conversation_history="",
-                contexts=context,
-                query=query,
-                language=self.language_name,
+                output_format_str="",
+                input_str=query,
+            )
+            # 在 <START_OF_CONTEXT> 之前插入上下文文本
+            # 因为当前上下文是纯文本字符串，不是 adalflow Document 对象列表
+            context_section = (
+                f"\n<START_OF_CONTEXT>\n{context}\n<END_OF_CONTEXT>\n"
+            )
+            # 在 <START_OF_USER_PROMPT> 之前插入
+            user_prompt = user_prompt.replace(
+                "<START_OF_USER_PROMPT>",
+                f"{context_section}<START_OF_USER_PROMPT>",
             )
             messages.append({"role": "user", "content": user_prompt})
         else:

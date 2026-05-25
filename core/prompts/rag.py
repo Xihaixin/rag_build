@@ -4,7 +4,22 @@ rag.py — RAG 系统提示词与模板
 
 从 api/prompts.py 迁移而来，供 core/flows/ 使用。
 不再依赖 api/ 模块。
+
+注意：RAG_TEMPLATE 是 Jinja2 风格模板，保留以兼容未来 adalflow 重构。
+当前使用 Jinja2 引擎渲染该模板。
 """
+
+import logging
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("core.prompts.rag")
+
+try:
+    from jinja2 import Template, TemplateError
+except ImportError:
+    logger.warning("jinja2 未安装，RAG_TEMPLATE 渲染将回退到 str.format()")
+    Template = None  # type: ignore
+    TemplateError = Exception  # type: ignore
 
 # RAG 系统提示词
 RAG_SYSTEM_PROMPT = r"""
@@ -198,3 +213,62 @@ IMPORTANT:You MUST respond in {language_name} language.
 - Use markdown formatting to improve readability
 - Cite specific files and code sections when relevant
 </style>"""
+
+
+# ── 模板渲染工具 ─────────────────────────────────────────────────────────
+
+
+def render_rag_template(
+    system_prompt: str,
+    output_format_str: str = "",
+    conversation_history: Optional[Dict[str, Any]] = None,
+    contexts: Optional[List[Any]] = None,
+    input_str: str = "",
+) -> str:
+    """
+    使用 Jinja2 渲染 RAG_TEMPLATE。
+
+    保留 RAG_TEMPLATE 的 Jinja2 语法不变，以兼容未来 adalflow 重构。
+    当前通过 Jinja2 引擎渲染该模板。
+
+    参数:
+        system_prompt: 系统提示词
+        output_format_str: 输出格式指令（adalflow DataClassParser 生成）
+        conversation_history: 对话历史字典（{turn_id: DialogTurn}）
+        contexts: 检索到的文档列表（每个元素需有 .meta_data 和 .text 属性）
+        input_str: 用户输入
+
+    返回:
+        渲染后的完整 prompt 字符串
+    """
+    if Template is None:
+        # 回退：简单替换 {var} 占位符，忽略 Jinja2 语法
+        logger.warning("jinja2 不可用，使用 str.format() 回退渲染")
+        result = RAG_TEMPLATE.replace("{# OrderedDict of DialogTurn #}", "")
+        # 移除 Jinja2 控制语句行
+        import re
+        result = re.sub(r"{%\s*(if|endif|for|endfor)\s*%}.*", "", result)
+        result = re.sub(r"\{\{.*?\}\}", "", result)
+        return result.format(
+            system_prompt=system_prompt,
+            output_format_str=output_format_str,
+        )
+
+    try:
+        template = Template(RAG_TEMPLATE)
+        return template.render(
+            system_prompt=system_prompt,
+            output_format_str=output_format_str,
+            conversation_history=conversation_history or {},
+            contexts=contexts or [],
+            input_str=input_str,
+        )
+    except TemplateError as e:
+        logger.error(f"RAG_TEMPLATE 渲染失败: {e}")
+        # 回退：只渲染 system_prompt 和 input_str
+        return (
+            f"<START_OF_SYS_PROMPT>\n{system_prompt}\n{output_format_str}\n"
+            f"<END_OF_SYS_PROMPT>\n\n"
+            f"<START_OF_USER_PROMPT>\n{input_str}\n<END_OF_USER_PROMPT>"
+        )
+
