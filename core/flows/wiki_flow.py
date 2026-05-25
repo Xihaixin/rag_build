@@ -16,8 +16,7 @@ wiki_flow.py — Wiki 文档生成流
   - core.models — WikiPage, WikiSection, WikiStructure
   - api.prompts — Prompt 模板
   - rag_optimizer.db.repository — DocumentRepository, WikiPageRepository
-  - scripts.simulate.data_ingestion — DataIngestor（自动触发）
-  - scripts.simulate.fixtures — 样本数据（回退）
+  - core.ingestion.ingestor — DataIngestor（自动触发）
 """
 
 import logging
@@ -38,15 +37,7 @@ from rag_optimizer.db.repository import DocumentRepository, WikiPageRepository
 from rag_optimizer.integration.deepwiki_adapter import PgvectorRetriever
 
 # 数据摄取（自动触发）
-from scripts.simulate.data_ingestion import DataIngestor
-
-# 样本数据（回退）
-from scripts.simulate.fixtures import (
-    SAMPLE_FILE_TREE,
-    SAMPLE_README,
-    SAMPLE_WIKI_STRUCTURE_XML,
-    SAMPLE_GENERATED_PAGE_CONTENT,
-)
+from core.ingestion.ingestor import DataIngestor
 
 logger = logging.getLogger("core.flows.wiki")
 
@@ -76,6 +67,7 @@ class WikiGenerationFlow(BaseFlow):
         language: str = "zh",
         comprehensive: bool = True,
         use_database: bool = True,
+        local_path: Optional[str] = None,
     ):
         # 调用 BaseFlow.__init__ 初始化公共属性
         super().__init__(
@@ -87,6 +79,7 @@ class WikiGenerationFlow(BaseFlow):
         )
 
         self.comprehensive = comprehensive
+        self.local_path = local_path
 
         # Wiki 生成状态
         self.file_tree: Optional[str] = None
@@ -101,6 +94,7 @@ class WikiGenerationFlow(BaseFlow):
 
         logger.info(f"初始化 WikiGenerationFlow:")
         logger.info(f"  仓库: {repo_url}")
+        logger.info(f"  本地路径: {local_path}")
         logger.info(f"  提供者: {provider}/{model}")
         logger.info(f"  语言: {self.language_name} ({language})")
         logger.info(f"  模式: {'comprehensive' if comprehensive else 'concise'}")
@@ -144,16 +138,15 @@ class WikiGenerationFlow(BaseFlow):
                 repo_url=self.repo_url,
                 repo_type=self.repo_type,
                 access_token=None,
-                local_path=None,
+                local_path=self.local_path,
             )
             project_id = ingestor.run()
 
             if not project_id:
                 logger.error("❌ 数据摄取失败，无法继续 Wiki 生成")
                 raise RuntimeError(
-                    f"数据摄取失败 (repo_url={self.repo_url})。"
-                    f"请先手动运行: python scripts/simulate/debug_flow.py "
-                    f"--mode ingest --repo-url {self.repo_url}"
+                    f"数据摄取失败 (repo_url={self.repo_url}, local_path={self.local_path})。"
+                    f"请先确保数据摄取已完成。"
                 )
 
             self.project_id = project_id
@@ -172,14 +165,12 @@ class WikiGenerationFlow(BaseFlow):
                 logger.error("❌ 数据摄取后仍无法从数据库获取仓库结构")
                 raise RuntimeError("数据摄取后数据库查询仍然失败")
 
-        # 回退到 fixtures 样本数据
-        logger.info("使用 fixtures 样本数据...")
-        self.file_tree = SAMPLE_FILE_TREE
-        self.readme = SAMPLE_README
-        logger.info(f"✓ 使用样本文件树 ({len(self.file_tree)} 字符)")
-        logger.info(f"✓ 使用样本 README ({len(self.readme)} 字符)")
-
-        return self.file_tree, self.readme
+        # 没有数据库回退，抛出异常
+        raise RuntimeError(
+            f"数据库中无此项目数据 (repo_url={self.repo_url})，"
+            f"且 use_database=False 模式已不再支持样本数据回退。"
+            f"请确保数据摄取已完成。"
+        )
 
     def _fetch_from_database(self) -> Optional[Tuple[str, str]]:
         """
@@ -268,8 +259,8 @@ class WikiGenerationFlow(BaseFlow):
             full_response = await call_llm_and_collect(self.provider, self.model, messages)
             logger.info(f"✓ LLM 返回响应 ({len(full_response)} 字符)")
         except Exception as e:
-            logger.warning(f"LLM 调用失败，使用样本数据: {e}")
-            full_response = SAMPLE_WIKI_STRUCTURE_XML
+            logger.error(f"LLM 调用失败，无法生成 Wiki 结构: {e}")
+            raise
 
         # 解析 XML
         self.wiki_structure = self._parse_wiki_xml(full_response)
@@ -450,13 +441,9 @@ Return ONLY valid XML with this exact structure:
             root = ET.fromstring(xml_text)
         except ET.ParseError as e:
             logger.warning(f"XML 解析失败，尝试修复: {e}")
-            # 如果解析失败，使用样本数据
-            logger.info("使用样本 Wiki 结构 XML 作为回退")
-            try:
-                root = ET.fromstring(SAMPLE_WIKI_STRUCTURE_XML)
-            except ET.ParseError:
-                # 极端回退：创建默认结构
-                return self._create_default_structure()
+            # 直接回退到默认结构
+            logger.info("使用默认 Wiki 结构作为回退")
+            return self._create_default_structure()
 
         # 提取基本信息
         title = self._extract_tag_text(root, "title") or f"{self.repo} Documentation"
@@ -645,8 +632,8 @@ Return ONLY valid XML with this exact structure:
         try:
             full_content = await call_llm_and_collect(self.provider, self.model, messages)
         except Exception as e:
-            logger.warning(f"LLM 调用失败，使用样本内容: {e}")
-            full_content = SAMPLE_GENERATED_PAGE_CONTENT
+            logger.error(f"LLM 调用失败，无法生成页面内容: {e}")
+            raise
 
         # 清理 markdown 代码块分隔符（对应前端 line 645 的 cleanMarkdownDelimiters）
         full_content = self._clean_markdown_delimiters(full_content)
@@ -677,7 +664,7 @@ Return ONLY valid XML with this exact structure:
             logger.info(f"  ✓ RAG 检索器已初始化 (project_id={self.project_id})")
             return retriever
         except Exception as e:
-            logger.warning(f"  初始化 RAG 检索器失败: {e}")
+            logger.warning(f"  初始化 RAG 检索器失败: {e}", exc_info=True)
             return None
 
     def _fetch_file_contents(self, page: WikiPage) -> Dict[str, str]:
@@ -805,9 +792,15 @@ Return ONLY valid XML with this exact structure:
                             context_text = "\n\n" + "-" * 10 + "\n\n".join(context_parts)
                             logger.info(f"  ✓ RAG 检索到 {len(results)} 个结果，来自 {len(docs_by_file)} 个文件")
                     else:
-                        logger.info("  RAG 检索未返回结果")
+                        # 区分"检索执行成功但无结果"和"检索执行失败"
+                        if stats and stats.total_results == 0 and stats.latency_ms > 0:
+                            logger.info(f"  RAG 检索完成（{stats.latency_ms}ms），但未找到相关结果")
+                        else:
+                            logger.info("  RAG 检索未返回结果")
+                else:
+                    logger.warning("  RAG 检索器初始化失败（retriever is None），跳过 RAG")
             except Exception as e:
-                logger.warning(f"  RAG 检索失败: {e}")
+                logger.warning(f"  RAG 检索失败: {e}", exc_info=True)
 
         # ── 3. 构建文件路径列表（带 URL） ──────────────────────────────────
         file_paths_str = ""
