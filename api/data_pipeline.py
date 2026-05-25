@@ -3,11 +3,14 @@
 
 替代原始 deepwiki-open 中使用 LocalDB + .pkl 的数据处理管道，
 底层使用 rag_optimizer 的 PostgreSQL + pgvector 存储。
+
+注意: download_repo, read_all_documents, count_tokens, get_file_content
+及系列函数已迁移至 core.utils.repo 和 core.utils.documents，
+此处仅做重导出以保持向后兼容。
 """
 
 import logging
 import os
-import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -22,250 +25,19 @@ from api.config import (
     configs,
     get_embedder_config,
 )
+from core.utils.repo import (
+    download_repo,
+    get_file_content,
+    get_github_file_content,
+    get_gitlab_file_content,
+    get_bitbucket_file_content,
+)
+from core.utils.documents import count_tokens, read_all_documents
 from rag_optimizer.config.settings import settings
 from rag_optimizer.db.repository import ProjectRepository, DocumentRepository, ChunkRepository, EmbeddingRepository
 from rag_optimizer.pipeline.ingestion import TextSplitter, Embedder, IngestionPipeline
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# Token 计数
-# ============================================================
-
-
-def count_tokens(text: str, embedder_type: Optional[str] = None, is_ollama_embedder: Optional[bool] = None) -> int:
-    """
-    计算文本的 token 数量
-
-    Args:
-        text: 文本内容
-        embedder_type: 嵌入器类型
-        is_ollama_embedder: 是否使用 Ollama 嵌入器
-
-    Returns:
-        int: token 数量
-    """
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except ImportError:
-        # 回退：使用简单估算（约 4 字符/token）
-        return len(text) // 4
-
-
-# ============================================================
-# 仓库下载
-# ============================================================
-
-
-def download_repo(
-    repo_url: str,
-    local_path: str,
-    repo_type: Optional[str] = None,
-    access_token: Optional[str] = None,
-) -> str:
-    """
-    下载仓库到本地
-
-    Args:
-        repo_url: 仓库 URL
-        local_path: 本地路径
-        repo_type: 仓库类型 (github, gitlab, bitbucket, gitee)
-        access_token: 访问令牌
-
-    Returns:
-        str: 本地路径
-    """
-    logger.info(f"Downloading repo: {repo_url} to {local_path}")
-
-    # 如果本地路径已存在，跳过下载
-    if os.path.exists(local_path) and os.listdir(local_path):
-        logger.info(f"Local path already exists: {local_path}")
-        return local_path
-
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-    try:
-        # 构建带认证的 URL
-        if access_token:
-            parsed = urlparse(repo_url)
-            auth_url = f"{parsed.scheme}://{access_token}@{parsed.netloc}{parsed.path}"
-        else:
-            auth_url = repo_url
-
-        # 执行 git clone
-        result = subprocess.run(
-            ["git", "clone", "--depth=1", auth_url, local_path],
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 分钟超时
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Git clone failed: {result.stderr}")
-            raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-
-        logger.info(f"Repository cloned successfully to {local_path}")
-        return local_path
-
-    except subprocess.TimeoutExpired:
-        logger.error("Git clone timed out")
-        raise RuntimeError("Repository clone timed out")
-    except Exception as e:
-        logger.error(f"Error downloading repo: {e}")
-        raise
-
-
-# ============================================================
-# 文档读取
-# ============================================================
-
-
-def read_all_documents(
-    path: str,
-    embedder_type: Optional[str] = None,
-    is_ollama_embedder: Optional[bool] = None,
-    excluded_dirs: Optional[List[str]] = None,
-    excluded_files: Optional[List[str]] = None,
-    included_dirs: Optional[List[str]] = None,
-    included_files: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    递归读取目录中的所有文档文件
-
-    Args:
-        path: 目录路径
-        embedder_type: 嵌入器类型
-        is_ollama_embedder: 是否使用 Ollama 嵌入器
-        excluded_dirs: 排除的目录列表
-        excluded_files: 排除的文件列表
-        included_dirs: 包含的目录列表
-        included_files: 包含的文件列表
-
-    Returns:
-        List[Dict]: 文档列表，每项包含 file_path, content, file_type
-    """
-    excluded_dirs = excluded_dirs or DEFAULT_EXCLUDED_DIRS
-    excluded_files = excluded_files or DEFAULT_EXCLUDED_FILES
-
-    documents: List[Dict[str, Any]] = []
-
-    # 规范化排除目录
-    normalized_excluded_dirs = []
-    for d in excluded_dirs:
-        d = d.strip("./").strip("/")
-        if d:
-            normalized_excluded_dirs.append(d)
-
-    def should_process_file(
-        file_path: str,
-        use_inclusion: bool,
-        included_dirs_list: List[str],
-        included_files_list: List[str],
-        excluded_dirs_list: List[str],
-        excluded_files_list: List[str],
-    ) -> bool:
-        """判断文件是否应该被处理"""
-        rel_path = os.path.relpath(file_path, path).replace("\\", "/")
-
-        # 检查排除目录
-        for excl_dir in excluded_dirs_list:
-            if rel_path.startswith(excl_dir + "/") or rel_path == excl_dir:
-                return False
-
-        # 检查排除文件
-        for excl_file in excluded_files_list:
-            if excl_file.startswith("*."):
-                # 通配符匹配
-                ext = excl_file[1:]
-                if rel_path.endswith(ext):
-                    return False
-            elif excl_file == os.path.basename(rel_path):
-                return False
-
-        # 包含模式
-        if use_inclusion:
-            in_included = False
-            for inc_dir in included_dirs_list:
-                if rel_path.startswith(inc_dir + "/") or rel_path == inc_dir:
-                    in_included = True
-                    break
-            for inc_file in included_files_list:
-                if inc_file == os.path.basename(rel_path):
-                    in_included = True
-                    break
-            return in_included
-
-        return True
-
-    use_inclusion_mode = bool(included_dirs or included_files)
-    included_dirs_list = included_dirs or []
-    included_files_list = included_files or []
-
-    # 支持的文件扩展名
-    text_extensions = {
-        ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cpp", ".c", ".h", ".hpp",
-        ".cs", ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".scala", ".dart",
-        ".md", ".mdx", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini",
-        ".cfg", ".conf", ".xml", ".html", ".css", ".scss", ".less", ".sql",
-        ".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd", ".dockerfile",
-        ".gradle", ".sbt", ".clj", ".ex", ".exs", ".erl", ".hrl",
-        ".lua", ".r", ".m", ".mm", ".pl", ".pm", ".t", ".pod",
-        ".vue", ".svelte", ".astro", ".graphql", ".gql", ".proto",
-        ".cmake", ".makefile", ".gnumakefile", ".dockerignore",
-        ".env.example", ".env.sample",
-    }
-
-    for root, dirs, files in os.walk(path):
-        # 过滤排除目录
-        rel_root = os.path.relpath(root, path).replace("\\", "/")
-        dirs[:] = [
-            d for d in dirs
-            if d not in normalized_excluded_dirs
-            and not d.startswith(".")
-        ]
-
-        for file in files:
-            file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, path).replace("\\", "/")
-
-            # 检查是否应该处理
-            if not should_process_file(
-                file_path,
-                use_inclusion_mode,
-                included_dirs_list,
-                included_files_list,
-                normalized_excluded_dirs,
-                excluded_files,
-            ):
-                continue
-
-            # 检查文件扩展名
-            ext = os.path.splitext(file)[1].lower()
-            if ext not in text_extensions and file not in (
-                "Dockerfile", "Makefile", "GNUmakefile",
-                "docker-compose.yml", "docker-compose.yaml",
-            ):
-                continue
-
-            # 读取文件内容
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-
-                if content.strip():
-                    documents.append({
-                        "file_path": rel_path,
-                        "content": content,
-                        "file_type": ext.lstrip(".") if ext else "text",
-                    })
-            except Exception as e:
-                logger.warning(f"Error reading file {file_path}: {e}")
-
-    logger.info(f"Read {len(documents)} documents from {path}")
-    return documents
 
 
 # ============================================================
@@ -363,123 +135,6 @@ def transform_documents_and_save_to_db(
 
 
 # ============================================================
-# 文件内容获取（GitHub/GitLab/Bitbucket API）
-# ============================================================
-
-
-def get_github_file_content(repo_url: str, file_path: str, access_token: Optional[str] = None) -> str:
-    """通过 GitHub API 获取文件内容"""
-    import urllib.request
-    import json
-
-    parsed_url = urlparse(repo_url)
-    path_parts = parsed_url.path.strip("/").split("/")
-
-    if len(path_parts) < 2:
-        raise ValueError(f"Invalid GitHub URL: {repo_url}")
-
-    owner, repo = path_parts[0], path_parts[1]
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path.lstrip('/')}"
-
-    headers = {
-        "Accept": "application/vnd.github.v3.raw",
-        "User-Agent": "DeepWiki-Open",
-    }
-    if access_token:
-        headers["Authorization"] = f"token {access_token}"
-
-    try:
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.read().decode("utf-8")
-    except Exception as e:
-        logger.error(f"Error fetching GitHub file {file_path}: {e}")
-        raise
-
-
-def get_gitlab_file_content(repo_url: str, file_path: str, access_token: Optional[str] = None) -> str:
-    """通过 GitLab API 获取文件内容"""
-    import urllib.request
-    import urllib.parse
-
-    parsed_url = urlparse(repo_url)
-    path_parts = parsed_url.path.strip("/").split("/")
-
-    if len(path_parts) < 2:
-        raise ValueError(f"Invalid GitLab URL: {repo_url}")
-
-    project_path = urllib.parse.quote("/".join(path_parts), safe="")
-    encoded_file_path = urllib.parse.quote(file_path.lstrip("/"), safe="")
-    api_url = f"https://gitlab.com/api/v4/projects/{project_path}/repository/files/{encoded_file_path}/raw"
-
-    headers = {"User-Agent": "DeepWiki-Open"}
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-
-    try:
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.read().decode("utf-8")
-    except Exception as e:
-        logger.error(f"Error fetching GitLab file {file_path}: {e}")
-        raise
-
-
-def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: Optional[str] = None) -> str:
-    """通过 Bitbucket API 获取文件内容"""
-    import urllib.request
-    import urllib.parse
-
-    parsed_url = urlparse(repo_url)
-    path_parts = parsed_url.path.strip("/").split("/")
-
-    if len(path_parts) < 2:
-        raise ValueError(f"Invalid Bitbucket URL: {repo_url}")
-
-    owner, repo = path_parts[0], path_parts[1]
-    encoded_path = urllib.parse.quote(file_path.lstrip("/"), safe="")
-    api_url = f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/src/master/{encoded_path}"
-
-    headers = {"User-Agent": "DeepWiki-Open"}
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-
-    try:
-        req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.read().decode("utf-8")
-    except Exception as e:
-        logger.error(f"Error fetching Bitbucket file {file_path}: {e}")
-        raise
-
-
-def get_file_content(
-    repo_url: str,
-    file_path: str,
-    repo_type: Optional[str] = None,
-    access_token: Optional[str] = None,
-) -> str:
-    """
-    从远程仓库获取文件内容
-
-    Args:
-        repo_url: 仓库 URL
-        file_path: 文件路径
-        repo_type: 仓库类型 (github, gitlab, bitbucket)
-        access_token: 访问令牌
-
-    Returns:
-        str: 文件内容
-    """
-    if repo_type == "gitlab" or "gitlab.com" in repo_url:
-        return get_gitlab_file_content(repo_url, file_path, access_token)
-    elif repo_type == "bitbucket" or "bitbucket.org" in repo_url:
-        return get_bitbucket_file_content(repo_url, file_path, access_token)
-    else:
-        return get_github_file_content(repo_url, file_path, access_token)
-
-
-# ============================================================
 # DatabaseManager — 兼容原始接口
 # ============================================================
 
@@ -487,6 +142,10 @@ def get_file_content(
 class DatabaseManager:
     """
     数据库管理器 — 兼容原始 deepwiki-open 的 DatabaseManager 接口
+
+    .. deprecated::
+        自 v0.1.0 起弃用。请使用 core.ingestion.ingestor.DataIngestor 进行数据摄取，
+        使用 rag_optimizer.integration.deepwiki_adapter.PgvectorRetriever 进行检索。
 
     底层使用 rag_optimizer 的 PgvectorDatabaseManager 和 PostgreSQL。
     """

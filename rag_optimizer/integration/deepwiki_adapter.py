@@ -38,6 +38,7 @@ from rag_optimizer.pipeline.ingestion import Embedder
 from rag_optimizer.retrieval.hybrid_retriever import (
     HybridRetriever,
     RetrievalResult,
+    RetrievalStats,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,9 +83,20 @@ class PgvectorRetriever:
         )
         self._embedder = Embedder(model_name=self.model_name)
 
-    def _get_embedding(self, text: str) -> List[float]:
-        """获取文本的嵌入向量"""
-        return self._embedder.embed_one(text)
+    def _get_embedding(self, text: str) -> Optional[List[float]]:
+        """获取文本的嵌入向量
+
+        Args:
+            text: 查询文本
+
+        Returns:
+            嵌入向量列表，获取失败时返回 None
+        """
+        try:
+            return self._embedder.embed_one(text)
+        except Exception as e:
+            logger.error(f"Failed to get embedding for query '{text[:50]}': {e}", exc_info=True)
+            return None
 
     # ----------------------------------------------------------
     # 兼容 FAISSRetriever 接口
@@ -99,18 +111,25 @@ class PgvectorRetriever:
             k: 返回结果数
 
         Returns:
-            List[Document] — 兼容 adalflow Document 格式
+            List[Document] — 兼容 adalflow Document 格式（异常时返回空列表）
         """
         top_k = k or self.top_k
         query_embedding = self._get_embedding(query)
+        if query_embedding is None:
+            logger.warning(f"PgvectorRetriever: embedding failed for query '{query[:50]}', returning empty")
+            return []
 
-        results, stats = self._hybrid_retriever.search(
-            query_text=query,
-            query_embedding=query_embedding,
-            retrieval_type=self.retrieval_type,
-            top_k=top_k,
-            log_retrieval=True,
-        )
+        try:
+            results, stats = self._hybrid_retriever.search(
+                query_text=query,
+                query_embedding=query_embedding,
+                retrieval_type=self.retrieval_type,
+                top_k=top_k,
+                log_retrieval=True,
+            )
+        except Exception as e:
+            logger.error(f"PgvectorRetriever: search failed: {e}", exc_info=True)
+            return []
 
         # 转换为兼容的 Document 格式
         documents = []
@@ -135,20 +154,48 @@ class PgvectorRetriever:
         top_k: Optional[int] = None,
         file_pattern: Optional[str] = None,
     ) -> Tuple[List[RetrievalResult], Any]:
-        """使用原生接口检索"""
+        """使用原生接口检索
+
+        Returns:
+            (检索结果列表, 检索统计) — 异常时返回 ([], stats)
+        """
         query_embedding = self._get_embedding(query)
-        return self._hybrid_retriever.search(
-            query_text=query,
-            query_embedding=query_embedding,
-            retrieval_type=retrieval_type or self.retrieval_type,
-            top_k=top_k or self.top_k,
-            file_pattern=file_pattern,
-            log_retrieval=True,
-        )
+        if query_embedding is None:
+            logger.warning(f"PgvectorRetriever.search: embedding failed for query '{query[:50]}'")
+            empty_stats = RetrievalStats(
+                retrieval_type=retrieval_type or self.retrieval_type,
+                top_k=top_k or self.top_k,
+                latency_ms=0,
+                total_results=0,
+                query_text=query,
+            )
+            return [], empty_stats
+
+        try:
+            return self._hybrid_retriever.search(
+                query_text=query,
+                query_embedding=query_embedding,
+                retrieval_type=retrieval_type or self.retrieval_type,
+                top_k=top_k or self.top_k,
+                file_pattern=file_pattern,
+                log_retrieval=True,
+            )
+        except Exception as e:
+            logger.error(f"PgvectorRetriever.search failed: {e}", exc_info=True)
+            empty_stats = RetrievalStats(
+                retrieval_type=retrieval_type or self.retrieval_type,
+                top_k=top_k or self.top_k,
+                latency_ms=0,
+                total_results=0,
+                query_text=query,
+            )
+            return [], empty_stats
 
     def vector_search(self, query: str, top_k: Optional[int] = None):
         """纯向量检索"""
         query_embedding = self._get_embedding(query)
+        if query_embedding is None:
+            return []
         return self._hybrid_retriever.vector_search(query_embedding, top_k=top_k or self.top_k)
 
     def keyword_search(self, query: str, top_k: Optional[int] = None):
@@ -158,11 +205,15 @@ class PgvectorRetriever:
     def hybrid_search(self, query: str, top_k: Optional[int] = None):
         """加权融合检索"""
         query_embedding = self._get_embedding(query)
+        if query_embedding is None:
+            return []
         return self._hybrid_retriever.hybrid_search(query, query_embedding, top_k=top_k or self.top_k)
 
     def rrf_search(self, query: str, top_k: Optional[int] = None):
         """RRF 融合检索"""
         query_embedding = self._get_embedding(query)
+        if query_embedding is None:
+            return []
         return self._hybrid_retriever.rrf_search(query, query_embedding, top_k=top_k or self.top_k)
 
 

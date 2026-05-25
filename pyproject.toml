@@ -1,3 +1,11 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["core*", "rag_optimizer*", "api*", "llm_clients*"]
+namespaces = false
+
 [project]
 name = "rag_build"
 version = "2.0.0"

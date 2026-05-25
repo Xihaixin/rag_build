@@ -183,10 +183,19 @@ class TextSplitter:
 class Embedder:
     """向量嵌入器（封装 DashScope Embedding API）"""
 
-    def __init__(self, model_name: Optional[str] = None, api_key: Optional[str] = None):
+    # DashScope text-embedding-v4 的 batch size 上限为 10
+    DASHSCOPE_MAX_BATCH_SIZE = 10
+
+    def __init__(self, model_name: Optional[str] = None, api_key: Optional[str] = None,
+                 dimensions: Optional[int] = None):
         self.model_name = model_name or settings.embedding.default_model
         self.api_key = api_key or settings.embedding.dashscope_api_key
-        self.batch_size = settings.embedding.batch_size
+        self.dimensions = dimensions or settings.embedding.default_dimensions
+        # DashScope text-embedding-v4 的 batch size 上限为 10
+        self.batch_size = min(
+            settings.embedding.batch_size,
+            self.DASHSCOPE_MAX_BATCH_SIZE,
+        )
 
         if not self.api_key:
             logger.warning("DASHSCOPE_API_KEY not set. Embedding will use mock vectors.")
@@ -199,14 +208,13 @@ class Embedder:
             texts: 文本列表
 
         Returns:
-            向量列表
+            向量列表（统一为 self.dimensions 维）
         """
         if not self.api_key:
             # Mock 模式：返回随机向量（用于测试）
             import random
             logger.warning(f"Using mock embeddings for {len(texts)} texts")
-            dim = settings.embedding.default_dimensions
-            return [[random.uniform(-1, 1) for _ in range(dim)] for _ in texts]
+            return [[random.uniform(-1, 1) for _ in range(self.dimensions)] for _ in texts]
 
         try:
             from openai import OpenAI
@@ -222,6 +230,7 @@ class Embedder:
                 response = client.embeddings.create(
                     model=self.model_name,
                     input=batch,
+                    dimensions=self.dimensions,  # 明确指定维度，确保与数据库表一致
                 )
                 batch_embeddings = [item.embedding for item in response.data]
                 all_embeddings.extend(batch_embeddings)
@@ -269,7 +278,8 @@ class IngestionPipeline:
 
     def process_document(self, file_path: str, content: str,
                          file_type: Optional[str] = None,
-                         is_code: bool = True) -> Tuple[int, int]:
+                         is_code: bool = True,
+                         force_reprocess: bool = False) -> Tuple[int, int]:
         """
         处理单个文档：分块 + 嵌入 + 写入
 
@@ -278,6 +288,7 @@ class IngestionPipeline:
             content: 文件内容
             file_type: 文件类型
             is_code: 是否为代码文件
+            force_reprocess: 是否强制重新处理（即使内容未变更也重新分块和嵌入）
 
         Returns:
             (chunk_count, embed_count)
@@ -292,43 +303,89 @@ class IngestionPipeline:
             token_count=len(content) // 4,
         )
 
-        if not changed:
-            return 0, 0  # 内容未变更，跳过
+        # 2. 判断是否需要重新分块
+        need_rechunk = changed or force_reprocess
 
-        # 2. 文本分块
+        if not need_rechunk:
+            # 内容未变更：检查是否已有向量嵌入
+            existing_chunks = ChunkRepository.get_by_document(doc_id)
+            if existing_chunks:
+                # 检查第一个 chunk 是否有对应的向量
+                first_chunk_id = existing_chunks[0]["id"]
+                has_embedding = sync_conn.execute(
+                    """SELECT 1 FROM chunk_embeddings_dim256
+                       WHERE chunk_id = %s LIMIT 1""",
+                    (first_chunk_id,)
+                )
+                if has_embedding:
+                    return 0, 0  # 内容未变更且已有向量，跳过
+
+                # 分块已存在但缺少向量 → 复用现有分块，只重新生成向量
+                logger.info(f"分块已存在但缺少向量，仅重新生成嵌入: {file_path}")
+                db_chunks = existing_chunks
+                chunk_id_map = {c["chunk_index"]: c["id"] for c in db_chunks}
+                texts = [c["content"] for c in db_chunks]
+                return self._embed_and_store(
+                    file_path, texts, chunk_id_map,
+                    len(db_chunks)
+                )
+
+            # 内容未变更但连分块都没有（异常情况），需要重新分块
+            logger.info(f"内容未变更但缺少分块，重新处理: {file_path}")
+            need_rechunk = True
+
+        # 3. 文本分块（内容变更 或 强制重新处理 或 缺少分块）
         chunks = self.splitter.split_text(content, file_type=file_type)
         ChunkRepository.batch_insert(doc_id, chunks)
         logger.debug(f"Split {file_path}: {len(chunks)} chunks")
 
-        # 3. 获取 chunk IDs
+        # 4. 获取 chunk IDs
         db_chunks = ChunkRepository.get_by_document(doc_id)
         chunk_id_map = {c["chunk_index"]: c["id"] for c in db_chunks}
 
-        # 4. 批量嵌入
+        # 5. 批量嵌入并存储
         texts = [c["content"] for c in chunks]
+        return self._embed_and_store(
+            file_path, texts, chunk_id_map, len(chunks)
+        )
+
+    def _embed_and_store(self, file_path: str, texts: List[str],
+                         chunk_id_map: Dict[int, str],
+                         chunk_count: int) -> Tuple[int, int]:
+        """
+        批量嵌入文本并存储向量到数据库。
+
+        Args:
+            file_path: 文件路径（仅用于日志）
+            texts: 待嵌入的文本列表
+            chunk_id_map: chunk_index → chunk_id 的映射
+            chunk_count: 分块总数（用于返回值）
+
+        Returns:
+            (chunk_count, embed_count)
+        """
         try:
             embeddings = self.embedder.embed(texts)
         except Exception as e:
             logger.error(f"Embedding failed for {file_path}: {e}")
-            return len(chunks), 0
+            return chunk_count, 0
 
-        # 5. 写入向量
         embed_count = 0
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk_db_id = chunk_id_map.get(chunk["chunk_index"])
+        for chunk_index, embedding in zip(chunk_id_map.keys(), embeddings):
+            chunk_db_id = chunk_id_map.get(chunk_index)
             if chunk_db_id:
                 EmbeddingRepository.insert(
                     chunk_id=chunk_db_id,
                     project_id=self.project_id,
                     model_id=self.model_id,
                     embedding=embedding,
-                    content=chunk["content"],
+                    content=texts[chunk_index],
                     file_path=file_path,
-                    chunk_index=chunk["chunk_index"],
+                    chunk_index=chunk_index,
                 )
                 embed_count += 1
 
-        return len(chunks), embed_count
+        return chunk_count, embed_count
 
     def process_documents(self, documents: List[Dict[str, Any]]) -> Dict[str, int]:
         """
@@ -367,7 +424,7 @@ class IngestionPipeline:
             # 更新任务进度
             if self.job_id and (i + 1) % 10 == 0:
                 IngestionJobRepository.update_status(
-                    self.job_id, "in_progress",
+                    self.job_id, "chunking",
                     stage="processing",
                     progress=(i + 1) / len(documents) if documents else 0,
                     processed=processed,

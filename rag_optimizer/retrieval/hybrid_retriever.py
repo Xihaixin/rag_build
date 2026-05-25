@@ -89,6 +89,10 @@ class HybridRetriever:
         Args:
             project_id: 项目 ID
             model_name: 嵌入模型名称，默认使用配置中的默认模型
+
+        Raises:
+            ValueError: 嵌入模型在数据库中不存在时抛出
+            RuntimeError: 数据库查询失败时抛出
         """
         self.project_id = project_id
         self.model_name = model_name or settings.embedding.default_model
@@ -97,10 +101,16 @@ class HybridRetriever:
         self.keyword_weight = settings.retrieval.hybrid_keyword_weight
 
         # 获取模型 ID
-        result = sync_conn.execute(
-            "SELECT id, dimensions FROM embedding_models WHERE name = %s",
-            (self.model_name,)
-        )
+        try:
+            result = sync_conn.execute(
+                "SELECT id, dimensions FROM embedding_models WHERE name = %s",
+                (self.model_name,)
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to query embedding model '{self.model_name}': {e}"
+            ) from e
+
         if result:
             self.model_id = str(result[0]["id"])
             self.dimensions = result[0]["dimensions"]
@@ -124,7 +134,7 @@ class HybridRetriever:
             file_pattern: 可选的文件路径过滤模式
 
         Returns:
-            检索结果列表
+            检索结果列表（异常时返回空列表）
         """
         k = top_k or self.top_k
         embedding_str = vector_to_str(query_embedding)
@@ -134,32 +144,16 @@ class HybridRetriever:
             "ce.project_id = %s",
             "ce.model_id = %s",
         ]
-        params = [self.project_id, self.model_id]
+        # 注意：SQL 中 %s 的顺序是：%s::vector (<=>) → project_id → model_id → [file_pattern] → LIMIT
+        params = [embedding_str, self.project_id, self.model_id]
 
         if file_pattern:
             where_clauses.append("ce.file_path LIKE %s")
             params.append(file_pattern)
 
         where_sql = " AND ".join(where_clauses)
-        params.append(embedding_str)
         params.append(k)
 
-        query = f"""
-            SELECT
-                ce.id,
-                ce.chunk_id,
-                ce.content,
-                ce.file_path,
-                ce.chunk_index,
-                1 - (ce.embedding <=> %s::vector) AS vector_score
-            FROM chunk_embeddings_dim256 ce
-            WHERE {where_sql}
-            ORDER BY ce.embedding <=> %s::vector
-            LIMIT %s
-        """
-
-        # 注意：<=> 运算符需要两个参数，这里用两次 embedding_str
-        # 修正：使用参数化查询
         query = f"""
             SELECT
                 ce.id,
@@ -175,13 +169,18 @@ class HybridRetriever:
         """
 
         # 重新构建参数
-        params = [self.project_id, self.model_id]
+        # 注意：SQL 中 %s 的顺序是：%s::vector (<=>) → project_id → model_id → [file_pattern] → LIMIT
+        params = [embedding_str, self.project_id, self.model_id]
         if file_pattern:
             params.append(file_pattern)
-        params.append(embedding_str)  # for <=>
         params.append(k)
 
-        result = sync_conn.execute(query, tuple(params))
+        try:
+            result = sync_conn.execute(query, tuple(params))
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}", exc_info=True)
+            return []
+
         if not result:
             return []
 
@@ -211,7 +210,7 @@ class HybridRetriever:
             file_pattern: 可选的文件路径过滤模式
 
         Returns:
-            检索结果列表
+            检索结果列表（异常时返回空列表）
         """
         k = top_k or self.top_k
 
@@ -219,14 +218,19 @@ class HybridRetriever:
             "ce.project_id = %s",
             "ce.model_id = %s",
         ]
-        params = [self.project_id, self.model_id]
+        # 注意：SQL 中 %s 的顺序是：
+        #   plainto_tsquery('simple', %s) [ts_rank] →
+        #   project_id → model_id → [file_pattern] →
+        #   plainto_tsquery('simple', %s) [@@] →
+        #   LIMIT %s
+        params = [query_text, self.project_id, self.model_id]
 
         if file_pattern:
             where_clauses.append("ce.file_path LIKE %s")
             params.append(file_pattern)
 
         where_sql = " AND ".join(where_clauses)
-        params.append(query_text)
+        params.append(query_text)  # 第二个 plainto_tsquery
         params.append(k)
 
         query = f"""
@@ -244,7 +248,12 @@ class HybridRetriever:
             LIMIT %s
         """
 
-        result = sync_conn.execute(query, tuple(params))
+        try:
+            result = sync_conn.execute(query, tuple(params))
+        except Exception as e:
+            logger.error(f"Keyword search failed: {e}", exc_info=True)
+            return []
+
         if not result:
             return []
 
@@ -272,6 +281,7 @@ class HybridRetriever:
         混合检索：向量 + 关键词加权融合
 
         使用加权求和方式融合两种检索结果。
+        当某一种检索失败时（返回空列表），仅使用另一种检索的结果。
 
         Args:
             query_text: 查询文本（用于关键词检索）
@@ -289,15 +299,19 @@ class HybridRetriever:
         kw = keyword_weight if keyword_weight is not None else self.keyword_weight
 
         # 分别执行两种检索（取更多结果以充分融合）
+        # 注意：vector_search/keyword_search 内部已捕获异常并返回空列表
         vector_results = self.vector_search(query_embedding, top_k=k * 3, file_pattern=file_pattern)
         keyword_results = self.keyword_search(query_text, top_k=k * 3, file_pattern=file_pattern)
 
         if not vector_results and not keyword_results:
+            logger.warning("Hybrid search: both vector and keyword searches returned no results")
             return []
 
         if not vector_results:
+            logger.warning("Hybrid search: vector search failed, falling back to keyword-only results")
             return keyword_results[:k]
         if not keyword_results:
+            logger.warning("Hybrid search: keyword search failed, falling back to vector-only results")
             return vector_results[:k]
 
         # 融合结果
@@ -353,6 +367,7 @@ class HybridRetriever:
 
         RRF 分数 = Σ(1 / (k + rank_i))
         其中 k 是常数（通常为 60），rank_i 是结果在第 i 个排序中的排名。
+        当某一种检索失败时，仅使用另一种检索的结果。
 
         Args:
             query_text: 查询文本
@@ -367,15 +382,19 @@ class HybridRetriever:
         k = top_k or self.top_k
 
         # 分别检索（取更多结果）
+        # 注意：vector_search/keyword_search 内部已捕获异常并返回空列表
         vector_results = self.vector_search(query_embedding, top_k=k * 5, file_pattern=file_pattern)
         keyword_results = self.keyword_search(query_text, top_k=k * 5, file_pattern=file_pattern)
 
         if not vector_results and not keyword_results:
+            logger.warning("RRF search: both vector and keyword searches returned no results")
             return []
 
         if not vector_results:
+            logger.warning("RRF search: vector search failed, falling back to keyword-only results")
             return keyword_results[:k]
         if not keyword_results:
+            logger.warning("RRF search: keyword search failed, falling back to vector-only results")
             return vector_results[:k]
 
         # RRF 分数计算
@@ -444,6 +463,9 @@ class HybridRetriever:
         """
         统一检索接口
 
+        内部捕获所有异常，确保不会因检索失败而中断调用方流程。
+        当检索执行失败时，返回空结果列表和统计信息。
+
         Args:
             query_text: 查询文本
             query_embedding: 查询向量
@@ -453,20 +475,27 @@ class HybridRetriever:
             log_retrieval: 是否记录检索日志
 
         Returns:
-            (检索结果列表, 检索统计)
+            (检索结果列表, 检索统计) — 异常时返回 ([], stats)
         """
         start_time = time.time()
         k = top_k or self.top_k
 
-        # 执行检索
-        if retrieval_type == "vector_only":
-            results = self.vector_search(query_embedding, top_k=k, file_pattern=file_pattern)
-        elif retrieval_type == "keyword_only":
-            results = self.keyword_search(query_text, top_k=k, file_pattern=file_pattern)
-        elif retrieval_type == "rrf":
-            results = self.rrf_search(query_text, query_embedding, top_k=k, file_pattern=file_pattern)
-        else:  # hybrid (default)
-            results = self.hybrid_search(query_text, query_embedding, top_k=k, file_pattern=file_pattern)
+        # 执行检索（各子方法内部已捕获异常并返回空列表）
+        try:
+            if retrieval_type == "vector_only":
+                results = self.vector_search(query_embedding, top_k=k, file_pattern=file_pattern)
+            elif retrieval_type == "keyword_only":
+                results = self.keyword_search(query_text, top_k=k, file_pattern=file_pattern)
+            elif retrieval_type == "rrf":
+                results = self.rrf_search(query_text, query_embedding, top_k=k, file_pattern=file_pattern)
+            else:  # hybrid (default)
+                results = self.hybrid_search(query_text, query_embedding, top_k=k, file_pattern=file_pattern)
+        except Exception as e:
+            logger.error(
+                f"Search [{retrieval_type}] failed unexpectedly: {e}",
+                exc_info=True
+            )
+            results = []
 
         latency_ms = int((time.time() - start_time) * 1000)
 

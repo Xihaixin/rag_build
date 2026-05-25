@@ -1,24 +1,22 @@
 {
   "embedder": {
     "batch_size": 16,
-    "initialize_kwargs": {
-      "api_key": "${DASHSCOPE_API_KEY}"
-    },
+    "initialize_kwargs": {},
     "model_kwargs": {
-      "model": "text-embedding-v3",
-      "dimensions": 1024
+      "model": "text-embedding-3-small",
+      "dimensions": 256
     }
   },
   "embedder_google": {
     "model_kwargs": {
       "model": "text-embedding-004",
-      "dimensions": 768
+      "dimensions": 256
     }
   },
   "embedder_bedrock": {
     "model_kwargs": {
       "model": "amazon.titan-embed-text-v2:0",
-      "dimensions": 1024
+      "dimensions": 256
     }
   },
   "embedder_ollama": {

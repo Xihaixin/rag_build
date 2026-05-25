@@ -42,14 +42,30 @@ class ProjectRepository:
     def get_or_create(name: str, repo_url: Optional[str] = None,
                       owner: Optional[str] = None, repo_type: str = "gitee",
                       local_path: Optional[str] = None) -> dict:
-        """获取或创建项目"""
+        """获取或创建项目
+
+        先按 repo_url 查找（如果提供），再按 name 查找。
+        如果都不存在则创建新项目。
+
+        NOTE: repo_url 可能为空字符串，此时不能用于查重，
+        改用 name 作为查找条件。
+        """
+        # 按 repo_url 查找（仅当 repo_url 非空时）
         if repo_url:
             existing = sync_conn.execute(
                 "SELECT * FROM projects WHERE repo_url = %s", (repo_url,)
             )
             if existing:
-                logger.info(f"Found existing project: {repo_url}")
+                logger.info(f"Found existing project by repo_url: {repo_url}")
                 return dict(existing[0])
+
+        # 按 name 查找（兜底：当 repo_url 为空或未找到时）
+        existing = sync_conn.execute(
+            "SELECT * FROM projects WHERE name = %s", (name,)
+        )
+        if existing:
+            logger.info(f"Found existing project by name: {name}")
+            return dict(existing[0])
 
         result = sync_conn.execute(
             """INSERT INTO projects (name, repo_url, owner, repo_type, local_path)
@@ -249,8 +265,29 @@ class EmbeddingRepository:
 # 摄取任务 Repository
 # ============================================================
 
+# 数据库 ingestion_status 枚举的有效值
+# 对应 SQL: CREATE TYPE ingestion_status AS ENUM (
+#   'pending', 'cloning', 'parsing', 'chunking',
+#   'embedding', 'indexing', 'completed', 'failed'
+# );
+VALID_INGESTION_STATUSES = frozenset({
+    "pending", "cloning", "parsing", "chunking",
+    "embedding", "indexing", "completed", "failed",
+})
+
+
 class IngestionJobRepository:
     """摄取任务数据访问"""
+
+    @staticmethod
+    def _validate_status(status: str) -> str:
+        """校验状态值是否在数据库枚举中，若无效则抛出 ValueError"""
+        if status not in VALID_INGESTION_STATUSES:
+            raise ValueError(
+                f"无效的摄取状态: '{status}'。"
+                f"有效值: {', '.join(sorted(VALID_INGESTION_STATUSES))}"
+            )
+        return status
 
     @staticmethod
     def create(project_id: str, trigger_type: str = "manual") -> dict:
@@ -269,7 +306,23 @@ class IngestionJobRepository:
                       processed: Optional[int] = None,
                       total: Optional[int] = None,
                       error: Optional[str] = None):
-        """更新任务状态"""
+        """更新任务状态
+
+        Args:
+            job_id: 任务 ID
+            status: 状态值（必须是 ingestion_status 枚举中的有效值）
+            stage: 当前阶段描述
+            progress: 进度 (0.0 ~ 1.0)
+            processed: 已处理文件数
+            total: 总文件数
+            error: 错误信息
+
+        Raises:
+            ValueError: 如果 status 不是有效的枚举值
+        """
+        # 校验状态值
+        IngestionJobRepository._validate_status(status)
+
         updates = ["status = %s"]
         params = [status]
 
@@ -295,10 +348,14 @@ class IngestionJobRepository:
             updates.append("completed_at = NOW()")
 
         params.append(job_id)
-        sync_conn.execute(
-            f"UPDATE ingestion_jobs SET {', '.join(updates)} WHERE id = %s",
-            tuple(params)
-        )
+        try:
+            sync_conn.execute(
+                f"UPDATE ingestion_jobs SET {', '.join(updates)} WHERE id = %s",
+                tuple(params)
+            )
+        except Exception as e:
+            logger.error(f"更新任务状态失败 (job_id={job_id}, status={status}): {e}")
+            raise
 
     @staticmethod
     def get_pending_jobs() -> List[dict]:
@@ -373,4 +430,95 @@ class PipelineLogRepository:
             (project_id, job_id, step_name, status,
              input_count, output_count, duration_ms,
              error_message, json.dumps(parameters) if parameters else None)
+        )
+
+
+# ============================================================
+# Wiki 页面 Repository
+# ============================================================
+
+class WikiPageRepository:
+    """Wiki 页面数据访问"""
+
+    @staticmethod
+    def upsert(project_id: str, page_slug: str, title: str,
+               content_md: str, language: str = "zh",
+               is_comprehensive: bool = True,
+               provider: Optional[str] = None,
+               model: Optional[str] = None,
+               source_chunks: Optional[List[Dict[str, Any]]] = None,
+               version: int = 1) -> str:
+        """
+        插入或更新 Wiki 页面。
+
+        使用 (project_id, page_slug, language) 唯一约束进行 UPSERT。
+        对应 SQL: wiki_pages 表的 UNIQUE (project_id, page_slug, language)。
+
+        Args:
+            project_id: 项目 ID
+            page_slug: 页面唯一标识（kebab-case）
+            title: 页面标题
+            content_md: Markdown 内容
+            language: 语言代码
+            is_comprehensive: 是否为综合模式
+            provider: LLM 提供者
+            model: LLM 模型
+            source_chunks: 来源分块列表
+            version: 版本号
+
+        Returns:
+            str: 页面 ID
+        """
+        result = sync_conn.execute(
+            """INSERT INTO wiki_pages
+               (project_id, page_slug, title, content_md, language,
+                is_comprehensive, provider, model, source_chunks, version)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+               ON CONFLICT (project_id, page_slug, language) DO UPDATE SET
+               title = EXCLUDED.title,
+               content_md = EXCLUDED.content_md,
+               is_comprehensive = EXCLUDED.is_comprehensive,
+               provider = EXCLUDED.provider,
+               model = EXCLUDED.model,
+               source_chunks = EXCLUDED.source_chunks,
+               version = wiki_pages.version + 1,
+               updated_at = NOW()
+               RETURNING id""",
+            (project_id, page_slug, title, content_md, language,
+             is_comprehensive, provider, model,
+             json.dumps(source_chunks) if source_chunks else None,
+             version)
+        )
+        return str(result[0]["id"])
+
+    @staticmethod
+    def get_by_project(project_id: str, language: Optional[str] = None) -> List[dict]:
+        """获取项目的所有 Wiki 页面"""
+        if language:
+            result = sync_conn.execute(
+                "SELECT * FROM wiki_pages WHERE project_id = %s AND language = %s ORDER BY created_at",
+                (project_id, language)
+            )
+        else:
+            result = sync_conn.execute(
+                "SELECT * FROM wiki_pages WHERE project_id = %s ORDER BY created_at",
+                (project_id,)
+            )
+        return [dict(r) for r in result] if result else []
+
+    @staticmethod
+    def get_by_slug(project_id: str, page_slug: str, language: str = "zh") -> Optional[dict]:
+        """根据 slug 获取 Wiki 页面"""
+        result = sync_conn.execute(
+            "SELECT * FROM wiki_pages WHERE project_id = %s AND page_slug = %s AND language = %s",
+            (project_id, page_slug, language)
+        )
+        return dict(result[0]) if result else None
+
+    @staticmethod
+    def delete_by_project(project_id: str):
+        """删除项目的所有 Wiki 页面"""
+        sync_conn.execute(
+            "DELETE FROM wiki_pages WHERE project_id = %s",
+            (project_id,)
         )
