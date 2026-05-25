@@ -47,11 +47,17 @@ def parse_repo_url(repo_url: str) -> Dict[str, str]:
     解析仓库 URL，提取 owner, repo, repo_type。
 
     参数:
-        repo_url: 仓库 URL（如 https://github.com/user/repo）
+        repo_url: 仓库 URL（如 https://github.com/user/repo 或 file:///local/path）
 
     返回:
         {"owner": str, "repo": str, "repo_type": str}
     """
+    # 处理 file:// 协议的本地路径
+    if repo_url.startswith("file://"):
+        local_path = repo_url.replace("file:///", "").replace("file://", "")
+        dirname = os.path.basename(os.path.normpath(local_path))
+        return {"owner": "", "repo": dirname, "repo_type": "local"}
+
     parsed = urlparse(repo_url)
     path_parts = parsed.path.strip("/").split("/")
 
@@ -130,6 +136,9 @@ def generate_file_url(file_path: str, repo_url: str, repo_type: str = "github") 
     生成平台特定的文件 URL。
 
     对应前端 page.tsx 中的 generateFileUrl() 函数。
+
+    对于本地项目（repo_type="local" 或 repo_url 以 file:// 开头），
+    返回本地文件路径而非远程 URL。
     """
     clean_path = file_path.lstrip("./").lstrip("/")
 
@@ -139,6 +148,12 @@ def generate_file_url(file_path: str, repo_url: str, repo_type: str = "github") 
         return f"{repo_url.rstrip('/')}/-/blob/main/{clean_path}"
     elif repo_type == "bitbucket":
         return f"{repo_url.rstrip('/')}/src/main/{clean_path}"
+    elif repo_type == "local" or repo_url.startswith("file://"):
+        # 本地项目：从 file:// URL 中提取本地路径
+        local_base = repo_url.replace("file:///", "").replace("file://", "")
+        # 如果 repo_url 是 file:///absolute/path，则 local_base 是 /absolute/path
+        # 拼接文件路径
+        return os.path.join(local_base, clean_path).replace("\\", "/")
     else:
         return f"{repo_url.rstrip('/')}/{clean_path}"
 

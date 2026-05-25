@@ -30,10 +30,32 @@ logger = logging.getLogger("core.cli")
 from dotenv import load_dotenv
 load_dotenv()
 
+import os
+
 from core.ingestion.ingestor import DataIngestor, check_project_exists
 from core.flows.wiki_flow import WikiGenerationFlow
 from core.flows.chat_flow import SimpleChatFlow
 from core.flows.research_flow import DeepResearchFlow
+
+
+def _resolve_repo_url(repo_url: Optional[str], local_path: Optional[str]) -> str:
+    """
+    解析仓库 URL：若未显式提供 repo_url，则从 local_path 推导。
+
+    推导规则：
+      1. 如果 repo_url 已提供，直接返回
+      2. 如果 local_path 已提供，使用 local_path 的目录名作为 repo 名，
+         构造一个本地友好的 URL（file:/// 格式）
+      3. 兜底返回空字符串（后续流程会报错提示用户）
+    """
+    if repo_url:
+        return repo_url
+    if local_path:
+        dirname = os.path.basename(os.path.normpath(local_path.rstrip("/\\")))
+        # 使用 file:// 协议表示本地项目
+        abs_path = os.path.abspath(local_path)
+        return f"file:///{abs_path.replace(os.sep, '/')}"
+    return ""
 
 
 # ============================================================
@@ -46,14 +68,16 @@ async def run_ingest_mode(args: Any) -> None:
     logger.info("模式: 数据摄取 (代码仓库 → PostgreSQL + pgvector)")
     logger.info("=" * 70)
 
+    repo_url = _resolve_repo_url(args.repo_url, args.local_path)
+
     # 检查项目是否已存在
-    existing = check_project_exists(args.repo_url)
+    existing = check_project_exists(repo_url)
     if existing:
         logger.info(f"项目已在数据库中 (id={existing})，将重新摄取")
 
     # 执行数据摄取
     ingestor = DataIngestor(
-        repo_url=args.repo_url,
+        repo_url=repo_url,
         repo_type=args.repo_type or "github",
         access_token=args.token,
         local_path=args.local_path,
@@ -63,9 +87,9 @@ async def run_ingest_mode(args: Any) -> None:
     if project_id:
         logger.info(f"\n✅ 数据摄取成功! project_id={project_id}")
         logger.info(f"现在可以运行其他模式使用此项目数据:")
-        logger.info(f"  python -m core.cli --mode wiki --repo-url {args.repo_url}")
-        logger.info(f"  python -m core.cli --mode chat --repo-url {args.repo_url} --query '...'")
-        logger.info(f"  python -m core.cli --mode research --repo-url {args.repo_url} --query '...'")
+        logger.info(f"  python -m core.cli --mode wiki --repo-url {repo_url}")
+        logger.info(f"  python -m core.cli --mode chat --repo-url {repo_url} --query '...'")
+        logger.info(f"  python -m core.cli --mode research --repo-url {repo_url} --query '...'")
     else:
         logger.error("\n❌ 数据摄取失败")
 
@@ -76,13 +100,15 @@ async def run_wiki_mode(args: Any) -> None:
     logger.info("模式: Wiki 文档生成")
     logger.info("=" * 70)
 
+    repo_url = _resolve_repo_url(args.repo_url, args.local_path)
+
     # ── 初始化 Wiki 生成流 ────────────────────────────────────────────────
     # WikiGenerationFlow.fetch_repository_structure() 内部会自动处理：
     #   1. use_database=True  → 尝试从数据库获取数据
     #   2. 数据库无数据       → 自动触发 DataIngestor 摄取管道
     #   3. 摄取完成           → 重新从数据库获取
     flow = WikiGenerationFlow(
-        repo_url=args.repo_url,
+        repo_url=repo_url,
         provider=args.provider,
         model=args.model,
         language=args.language,
@@ -105,8 +131,10 @@ async def run_chat_mode(args: Any) -> None:
     logger.info("模式: 用户 Q&A 简单聊天")
     logger.info("=" * 70)
 
+    repo_url = _resolve_repo_url(args.repo_url, args.local_path)
+
     flow = SimpleChatFlow(
-        repo_url=args.repo_url,
+        repo_url=repo_url,
         provider=args.provider,
         model=args.model,
         language=args.language,
@@ -129,8 +157,10 @@ async def run_research_mode(args: Any) -> None:
     logger.info("模式: 深度研究")
     logger.info("=" * 70)
 
+    repo_url = _resolve_repo_url(args.repo_url, args.local_path)
+
     flow = DeepResearchFlow(
-        repo_url=args.repo_url,
+        repo_url=repo_url,
         provider=args.provider,
         model=args.model,
         language=args.language,
@@ -186,8 +216,8 @@ def parse_args(argv: Optional[list] = None) -> Any:
     parser.add_argument(
         "--repo-url", "-u",
         type=str,
-        default="https://github.com/Xihaixin/MathModelAgent",
-        help="仓库 URL",
+        default=None,
+        help="仓库 URL（未指定时，若提供 --local-path 则自动从本地路径推导）",
     )
 
     parser.add_argument(

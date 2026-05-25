@@ -936,7 +936,7 @@ Return ONLY valid XML with this exact structure:
 
     def print_summary(self) -> None:
         """打印 Wiki 生成结果摘要"""
-        logger.info("\n" + "=" * 60)
+        logger.info("=" * 60)
         logger.info("Wiki 生成完成 — 结果摘要")
         logger.info("=" * 60)
 
