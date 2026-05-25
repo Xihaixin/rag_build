@@ -23,7 +23,7 @@ import sys
 from datetime import datetime
 from typing import Any, Optional
 
-from config.logging_config import setup_logging
+from core.config.logging_config import setup_logging
 setup_logging()
 logger = logging.getLogger("core.cli")
 
@@ -88,6 +88,7 @@ async def run_wiki_mode(args: Any) -> None:
         language=args.language,
         comprehensive=not args.concise,
         use_database=not args.no_db,
+        local_path=args.local_path,
     )
 
     # 执行完整流程（run() 内部包含所有步骤）
@@ -249,7 +250,7 @@ def parse_args(argv: Optional[list] = None) -> Any:
         "--local-path",
         type=str,
         default=None,
-        help="本地仓库路径（仅 ingest 模式，如果已克隆）",
+        help="本地仓库路径（ingest/wiki 模式通用）",
     )
 
     return parser.parse_args(argv)

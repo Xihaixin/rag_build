@@ -21,6 +21,7 @@ base.py — 业务流公共基类
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -171,12 +172,14 @@ class BaseFlow:
         model: str = "qwen-plus",
         language: str = "zh",
         use_database: bool = True,
+        local_path: Optional[str] = None,
     ):
         self.repo_url = repo_url
         self.provider = provider
         self.model = model
         self.language = language
         self.use_database = use_database
+        self.local_path = local_path
 
         # 解析仓库信息
         repo_info = parse_repo_url(repo_url)
@@ -197,9 +200,12 @@ class BaseFlow:
 
     def _find_project_id(self) -> Optional[str]:
         """
-        在数据库中查找与 repo_url 匹配的项目 ID。
+        在数据库中查找与 repo_url 或 local_path 匹配的项目 ID。
 
-        遍历 ProjectRepository.list_all()，按 repo_url 或项目名称匹配。
+        匹配优先级:
+          1. repo_url 精确/包含匹配
+          2. 项目名称匹配（从 repo_url 解析出的 repo 名）
+          3. local_path 匹配（从本地路径提取的目录名）
 
         返回:
             匹配到的 project_id，未找到则返回 None
@@ -207,18 +213,30 @@ class BaseFlow:
         try:
             projects = ProjectRepository.list_all()
             for proj in projects:
+                # 1. 按 repo_url 匹配
                 proj_url = proj.get("repo_url", "") or proj.get("url", "")
-                if self.repo_url in proj_url or proj_url in self.repo_url:
-                    pid = proj.get("id") or proj.get("project_id")
-                    self.project_id = str(pid) if pid else None
-                    return self.project_id
-                proj_name = proj.get("name", "")
-                if self.repo.lower() in proj_name.lower():
+                if proj_url and (self.repo_url in proj_url or proj_url in self.repo_url):
                     pid = proj.get("id") or proj.get("project_id")
                     self.project_id = str(pid) if pid else None
                     return self.project_id
 
-            logger.warning(f"未找到匹配的项目: {self.repo_url}")
+                # 2. 按项目名称匹配（从 repo_url 解析出的 repo 名）
+                proj_name = proj.get("name", "")
+                if self.repo and self.repo.lower() in proj_name.lower():
+                    pid = proj.get("id") or proj.get("project_id")
+                    self.project_id = str(pid) if pid else None
+                    return self.project_id
+
+                # 3. 按 local_path 匹配（从本地路径提取目录名）
+                if self.local_path:
+                    local_dirname = os.path.basename(os.path.normpath(self.local_path.rstrip("/\\")))
+                    if local_dirname.lower() == proj_name.lower():
+                        pid = proj.get("id") or proj.get("project_id")
+                        self.project_id = str(pid) if pid else None
+                        logger.info(f"✓ 通过 local_path 匹配到项目: {proj_name} (id={self.project_id})")
+                        return self.project_id
+
+            logger.warning(f"未找到匹配的项目: repo_url={self.repo_url}, local_path={self.local_path}")
             return None
         except Exception as e:
             logger.warning(f"查找项目失败: {e}")

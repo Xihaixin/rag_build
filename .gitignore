@@ -21,4 +21,6 @@ deepwiki_open_ref
 node_modules
 .next
 .vscode
+core/config/logs
+*.log
 
