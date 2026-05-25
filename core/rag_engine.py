@@ -87,6 +87,8 @@ class RAGEngine:
         )
         self.llm_model = settings.llm.default_model
         self.llm_provider = settings.llm.default_provider
+        # 保存最近一次检索的 retrieval_id，供 log_qa() 使用
+        self._last_retrieval_id: Optional[str] = None
 
     # ----------------------------------------------------------
     # 检索
@@ -130,6 +132,9 @@ class RAGEngine:
             file_pattern=file_pattern,
             log_retrieval=True,
         )
+
+        # 保存 retrieval_id 供后续 log_qa() 使用
+        self._last_retrieval_id = stats.retrieval_id
 
         return results, stats
 
@@ -382,11 +387,15 @@ class RAGEngine:
             answer: LLM 回答
             latency_ms: 耗时（毫秒）
             model_name: 模型名称（默认使用 self.llm_model）
-            retrieval_id: 关联的检索日志 ID（可选）
+            retrieval_id: 关联的检索日志 ID（可选，默认使用最近一次检索的 ID）
         """
         if not self.project_id:
             logger.debug("跳过 qa_logs 记录（无 project_id）")
             return
+
+        # 如果未传入 retrieval_id，使用最近一次检索的 ID
+        if retrieval_id is None:
+            retrieval_id = self._last_retrieval_id
 
         try:
             sync_conn.execute(
@@ -397,7 +406,7 @@ class RAGEngine:
                 (retrieval_id, self.project_id, query,
                  answer, model_name or self.llm_model, latency_ms),
             )
-            logger.debug(f"✓ 问答日志已记录到 qa_logs (project_id={self.project_id})")
+            logger.debug(f"✓ 问答日志已记录到 qa_logs (project_id={self.project_id}, retrieval_id={retrieval_id})")
         except Exception as e:
             logger.debug(f"记录 qa_logs 失败: {e}")
 

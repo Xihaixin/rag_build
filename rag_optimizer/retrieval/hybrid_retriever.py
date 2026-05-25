@@ -51,6 +51,7 @@ class RetrievalStats:
     latency_ms: int
     total_results: int
     query_text: str
+    retrieval_id: Optional[str] = None
 
 
 # ============================================================
@@ -500,6 +501,7 @@ class HybridRetriever:
         latency_ms = int((time.time() - start_time) * 1000)
 
         # 记录检索日志
+        retrieval_id: Optional[str] = None
         if log_retrieval:
             try:
                 retrieval_id = RetrievalRepository.log_retrieval(
@@ -533,6 +535,7 @@ class HybridRetriever:
             latency_ms=latency_ms,
             total_results=len(results),
             query_text=query_text,
+            retrieval_id=retrieval_id,
         )
 
         logger.info(

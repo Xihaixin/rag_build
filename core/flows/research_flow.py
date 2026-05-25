@@ -62,13 +62,11 @@ class DeepResearchFlow(BaseFlow):
     """
 
     # 研究完成标记 — 对应前端 Ask.tsx 中的 checkIfResearchComplete()
+    # 仅保留英文标记，因为 prompt 模板中固定使用英文完成标记
     COMPLETION_MARKERS = [
         "## Final Conclusion",
         "## Conclusion",
         "This concludes our research",
-        "## 最终结论",
-        "## 结论",
-        "本研究至此结束",
     ]
 
     # 最大迭代次数 — 对应前端 Ask.tsx 中的 MAX_RESEARCH_ITERATIONS
