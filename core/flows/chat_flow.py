@@ -5,23 +5,27 @@ chat_flow.py — 用户 Q&A 简单聊天流
 完整复现前端 Ask.tsx 中的简单聊天逻辑。
 
 流程:
-  1. 构建 RAG 上下文（从 pgvector 检索相关文档）
+  1. 使用 RAGEngine 检索相关文档（含 Embedding 缓存 + 检索日志）
   2. 组装 prompt（系统指令 + 对话历史 + RAG 上下文 + 用户问题）
   3. 调用 LLM 流式回答
-  4. 返回完整回答
+  4. 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
+  5. 返回完整回答
 
 依赖:
   - core.flows.base — BaseFlow 公共基类
   - core.models — Message
   - core.prompts.rag — SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
+  - core.rag_engine — RAGEngine（检索 + 日志记录）
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
 from core.models import Message
 from core.prompts.rag import SIMPLE_CHAT_SYSTEM_PROMPT, RAG_TEMPLATE
+from core.rag_engine import RAGEngine
 
 logger = logging.getLogger("core.flows.chat")
 
@@ -31,10 +35,11 @@ class SimpleChatFlow(BaseFlow):
     用户 Q&A 简单聊天流 — 完整复现前端 Ask.tsx 中的简单聊天逻辑。
 
     流程:
-      1. 构建 RAG 上下文（从 pgvector 检索相关文档）
+      1. 使用 RAGEngine 检索相关文档
       2. 组装 prompt（系统指令 + 对话历史 + RAG 上下文 + 用户问题）
       3. 调用 LLM 流式回答
-      4. 返回完整回答
+      4. 记录问答日志到 qa_logs 表
+      5. 返回完整回答
 
     对应前端 Ask.tsx 中的:
       - handleConfirmAsk() — 发送聊天请求
@@ -66,25 +71,57 @@ class SimpleChatFlow(BaseFlow):
         # 对话历史
         self.messages: List[Message] = []
 
+        # RAG 引擎（延迟初始化）
+        self.rag_engine: Optional[RAGEngine] = None
+
         logger.info(f"初始化 SimpleChatFlow:")
         logger.info(f"  仓库: {repo_url}")
         logger.info(f"  提供者: {provider}/{model}")
         logger.info(f"  语言: {self.language_name}")
 
+    def _init_rag_engine(self) -> Optional[RAGEngine]:
+        """
+        初始化 RAG 引擎。
+
+        使用 BaseFlow._find_project_id() 查找 project_id，
+        然后创建 RAGEngine 实例。
+        """
+        if not self.use_database:
+            logger.info("跳过 RAG 引擎初始化（use_database=False）")
+            return None
+
+        # 如果还没有 project_id，尝试查找
+        if not self.project_id:
+            self._find_project_id()
+
+        if not self.project_id:
+            logger.warning(f"未找到项目: {self.repo_url}，跳过 RAG 引擎")
+            return None
+
+        try:
+            self.rag_engine = RAGEngine(project_id=self.project_id)
+            logger.info(f"✓ RAG 引擎已初始化 (project_id={self.project_id})")
+            return self.rag_engine
+        except Exception as e:
+            logger.warning(f"初始化 RAG 引擎失败: {e}")
+            return None
+
     def _build_context(self, query: str) -> str:
         """
         构建 RAG 上下文文本。
 
+        使用 RAGEngine.retrieve() 进行检索（含 Embedding 缓存 + 检索日志），
+        然后将结果格式化为上下文文本。
+
         对应后端 api/simple_chat.py 中的 build_context_from_results() 函数。
-        使用 PgvectorRetriever 检索相关文档块，然后格式化为上下文文本。
         """
-        if not self.retriever:
-            logger.info("无 RAG 检索器，跳过上下文构建")
+        if not self.rag_engine:
+            logger.info("无 RAG 引擎，跳过上下文构建")
             return ""
 
         try:
-            # 执行检索 — PgvectorRetriever.search() 返回 (List[RetrievalResult], RetrievalStats)
-            results, stats = self.retriever.search(query, top_k=5)
+            # 使用 RAGEngine 执行检索（含 Embedding 缓存 + 检索日志）
+            results, stats = self.rag_engine.retrieve(query, top_k=5)
 
             if not results:
                 logger.info("检索结果为空")
@@ -93,7 +130,6 @@ class SimpleChatFlow(BaseFlow):
             # 构建上下文文本
             context_parts = []
             for i, result in enumerate(results, 1):
-                # RetrievalResult 是 dataclass，有 content, file_path, final_score 字段
                 content = getattr(result, "content", "") or ""
                 file_path = getattr(result, "file_path", "") or ""
                 score = getattr(result, "final_score", 0.0) or getattr(result, "vector_score", 0.0)
@@ -131,8 +167,10 @@ class SimpleChatFlow(BaseFlow):
 
         # 1. 系统指令
         system_prompt = SIMPLE_CHAT_SYSTEM_PROMPT.format(
-            language=self.language_name,
+            language_name=self.language_name,
             repo_url=self.repo_url,
+            repo_type=self.repo_type,
+            repo_name=self.repo,
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -169,19 +207,22 @@ class SimpleChatFlow(BaseFlow):
           3. 接收流式响应
 
         对应后端 api/simple_chat.py 中的 _handle_simple_chat() 流程：
-          1. 初始化 RAG 检索器
+          1. 初始化 RAG 引擎
           2. 检索相关文档
           3. 构建 prompt
           4. 调用 LLM 流式生成
+          5. 记录问答日志到 qa_logs 表
         """
         logger.info("\n" + "=" * 60)
         logger.info("SimpleChatFlow.chat()")
         logger.info("=" * 60)
         logger.info(f"问题: {query}")
 
-        # 步骤 1: 初始化 RAG 检索器
-        if not self.retriever:
-            self._init_retriever()
+        start_time = time.time()
+
+        # 步骤 1: 初始化 RAG 引擎
+        if not self.rag_engine:
+            self._init_rag_engine()
 
         # 步骤 2: 构建 RAG 上下文
         logger.info("步骤 1: RAG 检索...")
@@ -203,9 +244,22 @@ class SimpleChatFlow(BaseFlow):
             logger.error(f"LLM 调用失败: {e}")
             full_response = f"[错误] LLM 调用失败: {e}"
 
+        latency_ms = int((time.time() - start_time) * 1000)
+
         # 记录对话历史
         self.messages.append(Message(role="user", content=query))
         self.messages.append(Message(role="assistant", content=full_response))
+
+        # 步骤 5: 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
+        if self.rag_engine:
+            self.rag_engine.log_qa(
+                query=query,
+                answer=full_response,
+                latency_ms=latency_ms,
+                model_name=f"{self.provider}/{self.model}",
+            )
+        else:
+            logger.debug("跳过 qa_logs 记录（无 RAG 引擎）")
 
         return full_response
 
@@ -238,5 +292,5 @@ class SimpleChatFlow(BaseFlow):
         """
         return {
             "messages": self.messages,
-            "retriever_initialized": self.retriever is not None,
+            "retriever_initialized": self.rag_engine is not None,
         }

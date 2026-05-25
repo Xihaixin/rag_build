@@ -125,7 +125,7 @@ async def _handle_simple_chat_ws(
     处理普通 WebSocket 聊天 — 委托给 SimpleChatFlow
 
     SimpleChatFlow 负责:
-      1. 初始化 RAG 检索器
+      1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建 prompt（系统指令 + 上下文 + 用户问题）
 
@@ -143,8 +143,8 @@ async def _handle_simple_chat_ws(
             use_database=True,
         )
 
-        # 步骤 1: 初始化 RAG 检索器
-        flow._init_retriever(top_k=10)
+        # 步骤 1: 初始化 RAG 引擎（RAGEngine）
+        flow._init_rag_engine()
 
         # 步骤 2: 构建 RAG 上下文
         context = flow._build_context(query)
@@ -183,7 +183,7 @@ async def _handle_deep_research_ws(
     处理深度研究 WebSocket 聊天 — 委托给 DeepResearchFlow
 
     DeepResearchFlow 负责:
-      1. 初始化 RAG 检索器
+      1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建研究 prompt（根据迭代次数选择模板）
 
@@ -202,8 +202,8 @@ async def _handle_deep_research_ws(
             use_database=True,
         )
 
-        # 初始化 RAG 检索器
-        flow._init_retriever(top_k=10)
+        # 初始化 RAG 引擎（RAGEngine）
+        flow._init_rag_engine()
 
         # 使用简单的内存对话跟踪
         conversation_turns: List[Dict[str, str]] = []

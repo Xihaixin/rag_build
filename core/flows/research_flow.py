@@ -5,19 +5,23 @@ research_flow.py — 深度研究流
 完整复现前端 Ask.tsx 中的深度研究逻辑。
 
 流程:
-  1. 发送初始研究问题（带 [DEEP RESEARCH] 标记）
-  2. 自动继续研究（最多 5 轮迭代）
-  3. 每轮检测研究是否完成
-  4. 提取研究阶段（计划/更新/结论）
-  5. 返回完整研究结果
+  1. 使用 RAGEngine 检索相关文档（含 Embedding 缓存 + 检索日志）
+  2. 发送初始研究问题（带 [DEEP RESEARCH] 标记）
+  3. 自动继续研究（最多 5 轮迭代）
+  4. 每轮检测研究是否完成
+  5. 提取研究阶段（计划/更新/结论）
+  6. 记录问答日志到 qa_logs 表
+  7. 返回完整研究结果
 
 依赖:
   - core.flows.base — BaseFlow 公共基类
   - core.models — Message, ResearchStage
   - core.prompts.rag — DEEP_RESEARCH_*_ITERATION_PROMPT, SIMPLE_CHAT_SYSTEM_PROMPT
+  - core.rag_engine — RAGEngine（检索 + 日志记录）
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
@@ -28,6 +32,7 @@ from core.prompts.rag import (
     DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT,
     DEEP_RESEARCH_FINAL_ITERATION_PROMPT,
 )
+from core.rag_engine import RAGEngine
 
 logger = logging.getLogger("core.flows.research")
 
@@ -37,11 +42,13 @@ class DeepResearchFlow(BaseFlow):
     深度研究流 — 完整复现前端 Ask.tsx 中的深度研究逻辑。
 
     流程:
-      1. 发送初始研究问题（带 [DEEP RESEARCH] 标记）
-      2. 自动继续研究（最多 5 轮迭代）
-      3. 每轮检测研究是否完成
-      4. 提取研究阶段（计划/更新/结论）
-      5. 返回完整研究结果
+      1. 使用 RAGEngine 检索相关文档
+      2. 发送初始研究问题（带 [DEEP RESEARCH] 标记）
+      3. 自动继续研究（最多 5 轮迭代）
+      4. 每轮检测研究是否完成
+      5. 提取研究阶段（计划/更新/结论）
+      6. 记录问答日志到 qa_logs 表
+      7. 返回完整研究结果
 
     对应前端 Ask.tsx 中的:
       - handleConfirmAsk() — 发送初始研究请求
@@ -91,20 +98,54 @@ class DeepResearchFlow(BaseFlow):
         self.is_complete: bool = False
         self.final_answer: str = ""
 
+        # RAG 引擎（延迟初始化）
+        self.rag_engine: Optional[RAGEngine] = None
+
         logger.info(f"初始化 DeepResearchFlow:")
         logger.info(f"  仓库: {repo_url}")
         logger.info(f"  提供者: {provider}/{model}")
         logger.info(f"  语言: {self.language_name}")
         logger.info(f"  最大迭代: {self.MAX_ITERATIONS}")
 
+    def _init_rag_engine(self) -> Optional[RAGEngine]:
+        """
+        初始化 RAG 引擎。
+
+        使用 BaseFlow._find_project_id() 查找 project_id，
+        然后创建 RAGEngine 实例。
+        """
+        if not self.use_database:
+            logger.info("跳过 RAG 引擎初始化（use_database=False）")
+            return None
+
+        if not self.project_id:
+            self._find_project_id()
+
+        if not self.project_id:
+            logger.warning(f"未找到项目: {self.repo_url}，跳过 RAG 引擎")
+            return None
+
+        try:
+            self.rag_engine = RAGEngine(project_id=self.project_id)
+            logger.info(f"✓ RAG 引擎已初始化 (project_id={self.project_id})")
+            return self.rag_engine
+        except Exception as e:
+            logger.warning(f"初始化 RAG 引擎失败: {e}")
+            return None
+
     def _build_context(self, query: str) -> str:
-        """构建 RAG 上下文（同 SimpleChatFlow）"""
-        if not self.retriever:
+        """
+        构建 RAG 上下文文本。
+
+        使用 RAGEngine.retrieve() 进行检索（含 Embedding 缓存 + 检索日志），
+        然后将结果格式化为上下文文本。
+        """
+        if not self.rag_engine:
             return ""
 
         try:
-            # 执行检索 — PgvectorRetriever.search() 返回 (List[RetrievalResult], RetrievalStats)
-            results, stats = self.retriever.search(query, top_k=5)
+            # 使用 RAGEngine 执行检索（含 Embedding 缓存 + 检索日志）
+            results, stats = self.rag_engine.retrieve(query, top_k=5)
             if not results:
                 return ""
 
@@ -143,8 +184,10 @@ class DeepResearchFlow(BaseFlow):
 
         # 系统指令
         system_prompt = SIMPLE_CHAT_SYSTEM_PROMPT.format(
-            language=self.language_name,
+            language_name=self.language_name,
             repo_url=self.repo_url,
+            repo_type=self.repo_type,
+            repo_name=self.repo,
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -236,9 +279,11 @@ class DeepResearchFlow(BaseFlow):
         logger.info(f"研究问题: {query}")
         logger.info(f"最大迭代: {self.MAX_ITERATIONS}")
 
-        # 初始化 RAG 检索器
-        if not self.retriever:
-            self._init_retriever()
+        start_time = time.time()
+
+        # 初始化 RAG 引擎
+        if not self.rag_engine:
+            self._init_rag_engine()
 
         # 构建初始 RAG 上下文
         context = self._build_context(query)
@@ -296,6 +341,19 @@ class DeepResearchFlow(BaseFlow):
         if not self.is_complete:
             logger.info(f"达到最大迭代次数 ({self.MAX_ITERATIONS})，研究结束")
             self.final_answer = self.messages[-1].content if self.messages else ""
+
+        latency_ms = int((time.time() - start_time) * 1000)
+
+        # 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
+        if self.rag_engine:
+            self.rag_engine.log_qa(
+                query=query,
+                answer=self.final_answer,
+                latency_ms=latency_ms,
+                model_name=f"{self.provider}/{self.model}",
+            )
+        else:
+            logger.debug("跳过 qa_logs 记录（无 RAG 引擎）")
 
         logger.info(f"\n✓ 深度研究完成")
         logger.info(f"总迭代: {self.current_iteration}")

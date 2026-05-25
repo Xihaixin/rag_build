@@ -121,7 +121,7 @@ async def _handle_simple_chat(
     处理普通聊天模式 — 委托给 SimpleChatFlow
 
     SimpleChatFlow 负责:
-      1. 初始化 RAG 检索器
+      1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建 prompt（系统指令 + 上下文 + 用户问题）
 
@@ -141,8 +141,8 @@ async def _handle_simple_chat(
 
     async def response_stream():
         try:
-            # 步骤 1: 初始化 RAG 检索器
-            flow._init_retriever(top_k=10)
+            # 步骤 1: 初始化 RAG 引擎
+            flow._init_rag_engine()
 
             # 步骤 2: 构建 RAG 上下文
             context = flow._build_context(query)
@@ -182,7 +182,7 @@ async def _handle_deep_research(
     处理深度研究模式 — 委托给 DeepResearchFlow
 
     DeepResearchFlow 负责:
-      1. 初始化 RAG 检索器
+      1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建研究 prompt（根据迭代次数选择模板）
 
@@ -206,8 +206,8 @@ async def _handle_deep_research(
 
     async def research_stream():
         try:
-            # 初始化 RAG 检索器
-            flow._init_retriever(top_k=10)
+            # 初始化 RAG 引擎
+            flow._init_rag_engine()
 
             for iteration in range(1, total_iterations + 1):
                 # 构建 RAG 上下文

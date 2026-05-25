@@ -147,24 +147,24 @@ class DatabaseManager:
         自 v0.1.0 起弃用。请使用 core.ingestion.ingestor.DataIngestor 进行数据摄取，
         使用 rag_optimizer.integration.deepwiki_adapter.PgvectorRetriever 进行检索。
 
-    底层使用 rag_optimizer 的 PgvectorDatabaseManager 和 PostgreSQL。
+    底层使用 ProjectRepository 和 PostgreSQL。
     """
 
     def __init__(self):
-        from rag_optimizer.integration.deepwiki_adapter import PgvectorDatabaseManager
-        self._impl = PgvectorDatabaseManager()
+        self._project_id: Optional[str] = None
+        self._repo_name: Optional[str] = None
 
     @property
     def project_id(self) -> Optional[str]:
-        return self._impl.project_id
+        return self._project_id
 
     @project_id.setter
     def project_id(self, value: Optional[str]):
-        self._impl.project_id = value
+        self._project_id = value
 
     @property
     def repo_name(self) -> Optional[str]:
-        return self._impl.repo_name
+        return self._repo_name
 
     def prepare_database(
         self,
@@ -172,12 +172,58 @@ class DatabaseManager:
         repo_type: str = "gitee",
         access_token: Optional[str] = None,
     ) -> str:
-        """准备数据库"""
-        return self._impl.prepare_database(repo_url_or_path, repo_type, access_token)
+        """准备数据库 — 创建或获取项目记录"""
+        repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type)
+        self._repo_name = repo_name
+
+        project = ProjectRepository.get_or_create(
+            name=repo_name,
+            repo_url=repo_url_or_path,
+        )
+        self._project_id = str(project["id"])
+
+        logger.info(f"Database prepared: project={repo_name}, id={self._project_id}")
+        return self._project_id
 
     def reset_database(self):
-        """重置数据库"""
-        self._impl.reset_database()
+        """重置数据库 — 清空项目相关数据"""
+        if not self._project_id:
+            logger.warning("No project_id set, cannot reset.")
+            return
+
+        try:
+            from rag_optimizer.db.connection import sync_conn
+
+            sync_conn.execute(
+                "DELETE FROM qa_logs WHERE project_id = %s", (self._project_id,)
+            )
+            sync_conn.execute(
+                "DELETE FROM retrieval_results WHERE retrieval_id IN "
+                "(SELECT id FROM retrieval_logs WHERE project_id = %s)",
+                (self._project_id,),
+            )
+            sync_conn.execute(
+                "DELETE FROM retrieval_logs WHERE project_id = %s",
+                (self._project_id,),
+            )
+            sync_conn.execute(
+                "DELETE FROM chunk_embeddings_dim256 WHERE chunk_id IN "
+                "(SELECT id FROM document_chunks WHERE document_id IN "
+                "(SELECT id FROM raw_documents WHERE project_id = %s))",
+                (self._project_id,),
+            )
+            sync_conn.execute(
+                "DELETE FROM document_chunks WHERE document_id IN "
+                "(SELECT id FROM raw_documents WHERE project_id = %s)",
+                (self._project_id,),
+            )
+            sync_conn.execute(
+                "DELETE FROM raw_documents WHERE project_id = %s",
+                (self._project_id,),
+            )
+            logger.info(f"Database reset for project {self._project_id}")
+        except Exception as e:
+            logger.error(f"Database reset error: {e}")
 
     def _extract_repo_name_from_url(self, repo_url_or_path: str, repo_type: str) -> str:
         """从 URL 提取仓库名"""

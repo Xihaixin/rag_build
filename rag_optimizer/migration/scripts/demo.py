@@ -237,7 +237,7 @@ def step_rag_qa(project_id: str) -> bool:
     print_header("步骤 5: RAG 问答演示")
 
     try:
-        from rag_optimizer.pipeline.rag_engine import RAGEngine
+        from core.rag_engine import RAGEngine
 
         engine = RAGEngine(project_id=project_id)
 
