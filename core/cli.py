@@ -169,7 +169,7 @@ async def run_research_mode(args: Any) -> None:
 
     final_answer = await flow.research(args.query)
 
-    logger.info("\n" + "=" * 60)
+    logger.info("=" * 60)
     logger.info("最终研究结果:")
     logger.info("=" * 60)
     logger.info(final_answer)

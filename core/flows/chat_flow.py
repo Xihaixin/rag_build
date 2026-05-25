@@ -275,11 +275,11 @@ class SimpleChatFlow(BaseFlow):
 
     def print_conversation(self) -> None:
         """打印对话历史"""
-        logger.info("\n" + "=" * 60)
+        logger.info("=" * 60)
         logger.info("对话历史")
         logger.info("=" * 60)
         for i, msg in enumerate(self.messages):
-            role_label = "👤 用户" if msg.role == "user" else "🤖 助手"
+            role_label = "[User]" if msg.role == "user" else "[Assistant]"
             logger.info(f"\n[{i + 1}] {role_label}:")
             # 只打印前 200 字符
             preview = msg.content[:200]

@@ -219,10 +219,13 @@ async def _handle_deep_research_ws(
                 context=context,
             )
 
-            # 如果有对话历史，添加到 messages 中
+            # 如果有对话历史，按正确顺序添加到 messages 中
+            # 正确顺序：user → assistant → user(continue) → assistant → ...
             for turn in conversation_turns:
+                messages.append({"role": "user", "content": turn["user"]})
                 messages.append({"role": "assistant", "content": turn["assistant"]})
-                messages.append({"role": "user", "content": "[DEEP RESEARCH] Continue the research"})
+            # 添加继续研究的 user 消息
+            messages.append({"role": "user", "content": "[DEEP RESEARCH] Continue the research"})
 
             # 发送迭代开始信号
             await websocket.send_text(f"[ITERATION_START:{i}]")

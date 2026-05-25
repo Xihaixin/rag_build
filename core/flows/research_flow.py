@@ -25,7 +25,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core.flows.base import BaseFlow, call_llm_and_collect
-from core.models import Message, ResearchStage
+from core.models import ResearchStage
 from core.prompts.rag import (
     SIMPLE_CHAT_SYSTEM_PROMPT,
     DEEP_RESEARCH_FIRST_ITERATION_PROMPT,
@@ -92,7 +92,8 @@ class DeepResearchFlow(BaseFlow):
         )
 
         # 研究状态
-        self.messages: List[Message] = []
+        # 使用 List[Dict[str, str]] 存储对话历史，与 LLM API 兼容
+        self.messages: List[Dict[str, str]] = []
         self.research_stages: List[ResearchStage] = []
         self.current_iteration: int = 0
         self.is_complete: bool = False
@@ -304,9 +305,9 @@ class DeepResearchFlow(BaseFlow):
             # 构建研究 prompt
             messages = self._build_research_prompt(query, iteration, context)
 
-            # 如果有对话历史，添加到 messages 中
-            for msg in self.messages:
-                messages.append({"role": msg.role, "content": msg.content})
+            # 如果有对话历史，按顺序添加到 messages 中
+            # self.messages 存储格式为 [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
+            messages.extend(self.messages)
 
             # 调用 LLM
             logger.info(f"调用 LLM ({self.provider}/{self.model})...")
@@ -320,8 +321,8 @@ class DeepResearchFlow(BaseFlow):
                 logger.error(f"LLM 调用失败: {e}")
                 full_response = f"[错误] LLM 调用失败: {e}"
 
-            # 记录消息
-            self.messages.append(Message(role="assistant", content=full_response))
+            # 记录消息（统一使用 dict 格式，与 LLM API 兼容）
+            self.messages.append({"role": "assistant", "content": full_response})
 
             # 提取研究阶段
             stage = self._extract_stage(full_response, iteration)
@@ -341,12 +342,12 @@ class DeepResearchFlow(BaseFlow):
                 # 对应前端 Ask.tsx 中 continueResearch() 的逻辑：
                 # 添加 "[DEEP RESEARCH] Continue the research" 到消息历史
                 continue_prompt = "[DEEP RESEARCH] Continue the research"
-                self.messages.append(Message(role="user", content=continue_prompt))
+                self.messages.append({"role": "user", "content": continue_prompt})
                 logger.info("  准备继续下一轮研究...")
 
         if not self.is_complete:
             logger.info(f"达到最大迭代次数 ({self.MAX_ITERATIONS})，研究结束")
-            self.final_answer = self.messages[-1].content if self.messages else ""
+            self.final_answer = self.messages[-1]["content"] if self.messages else ""
 
         latency_ms = int((time.time() - start_time) * 1000)
 
@@ -373,7 +374,7 @@ class DeepResearchFlow(BaseFlow):
         logger.info("深度研究 — 结果摘要")
         logger.info("=" * 60)
 
-        logger.info(f"研究问题: {self.messages[0].content if self.messages else 'N/A'}")
+        logger.info(f"研究问题: {self.messages[0]['content'] if self.messages else 'N/A'}")
         logger.info(f"总迭代: {self.current_iteration}/{self.MAX_ITERATIONS}")
         logger.info(f"是否完成: {'是' if self.is_complete else '否'}")
         logger.info(f"")
