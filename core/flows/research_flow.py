@@ -368,7 +368,7 @@ class DeepResearchFlow(BaseFlow):
 
     def print_research_summary(self) -> None:
         """打印研究结果摘要"""
-        logger.info("\n" + "=" * 60)
+        logger.info("=" * 60)
         logger.info("深度研究 — 结果摘要")
         logger.info("=" * 60)
 
