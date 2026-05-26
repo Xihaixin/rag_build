@@ -425,7 +425,47 @@ class WikiPage(Base):
 
 
 # ============================================================
-# 14. 对话历史表
+# 14. Wiki 缓存表
+# ============================================================
+
+
+class WikiCache(Base):
+    """Wiki 缓存（存储 Wiki 结构 + 元数据）"""
+    __tablename__ = "wiki_caches"
+    __table_args__ = (
+        UniqueConstraint("project_id", "language", name="unique_wiki_cache_per_project_lang"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+
+    language: Mapped[str] = mapped_column(String(10), default="zh")
+
+    # Wiki 结构（JSONB，包含 sections、page hierarchy 等）
+    structure_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    # 仓库信息
+    repo_owner: Mapped[Optional[str]] = mapped_column(String(255))
+    repo_name: Mapped[Optional[str]] = mapped_column(String(255))
+    repo_type: Mapped[Optional[str]] = mapped_column(String(50), default="github")
+    repo_url: Mapped[Optional[str]] = mapped_column(Text)
+
+    # LLM 配置
+    provider: Mapped[Optional[str]] = mapped_column(String(50))
+    model: Mapped[Optional[str]] = mapped_column(String(100))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # 关系
+    project: Mapped["Project"] = relationship(back_populates="wiki_caches")
+
+    def __repr__(self):
+        return f"<WikiCache(project={self.project_id}, lang='{self.language}')>"
+
+
+# ============================================================
+# 15. 对话历史表
 # ============================================================
 
 class Conversation(Base):

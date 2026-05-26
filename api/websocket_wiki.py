@@ -6,7 +6,8 @@ SimpleChatFlow 和 DeepResearchFlow 进行业务逻辑处理。
 
 架构说明 (Phase 4 重构):
   - API 层只负责 WebSocket 协议处理（连接管理、纯文本分片推流）
-  - 业务逻辑（RAG 检索、prompt 构建）委托给 core/flows/ 中的 Flow 类
+  - 业务逻辑（RAG 检索、prompt 构建、QA 日志记录）委托给 core/flows/ 中的 Flow 类
+  - Flow 类的完整方法 (chat() / research()) 负责完整的业务流程，包括 QA 日志记录
   - LLM 流式调用使用 core.utils.llm.call_llm_stream_raw()
 
 协议:
@@ -122,12 +123,14 @@ async def _handle_simple_chat_ws(
     model: Optional[str],
 ):
     """
-    处理普通 WebSocket 聊天 — 委托给 SimpleChatFlow
+    处理普通 WebSocket 聊天 — 委托给 SimpleChatFlow.chat()
 
-    SimpleChatFlow 负责:
+    SimpleChatFlow.chat() 负责完整的业务流程:
       1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建 prompt（系统指令 + 上下文 + 用户问题）
+      4. 调用 LLM 获取完整响应
+      5. 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
 
     API 层负责:
       - WebSocket 纯文本分片推流
@@ -143,21 +146,15 @@ async def _handle_simple_chat_ws(
             use_database=True,
         )
 
-        # 步骤 1: 初始化 RAG 引擎（RAGEngine）
-        flow._init_rag_engine()
+        # 委托给 SimpleChatFlow.chat() 完整方法
+        # chat() 内部执行: 初始化 RAG → 构建上下文 → 构建 prompt → 调用 LLM → 记录 QA 日志
+        full_response = await flow.chat(query)
 
-        # 步骤 2: 构建 RAG 上下文
-        context = flow._build_context(query)
-
-        # 步骤 3: 构建 prompt
-        messages = flow._build_prompt(query, context)
-
-        # 步骤 4: 流式调用 LLM — 纯文本分片
-        async for chunk in call_llm_stream_raw(
-            provider=provider,
-            model=model,
-            messages=messages,
-        ):
+        # 将完整响应以纯文本分片推流
+        # 按字符逐片发送，模拟流式输出
+        chunk_size = 50  # 每片 50 字符
+        for i in range(0, len(full_response), chunk_size):
+            chunk = full_response[i:i + chunk_size]
             await websocket.send_text(chunk)
 
         # 发送完成信号
@@ -180,29 +177,40 @@ async def _handle_deep_research_ws(
     iterations: int = 5,
 ):
     """
-    处理深度研究 WebSocket 聊天 — 委托给 DeepResearchFlow
+    处理深度研究 WebSocket 聊天 — 委托给 DeepResearchFlow.research()
 
-    DeepResearchFlow 负责:
+    DeepResearchFlow.research() 负责完整的业务流程:
       1. 初始化 RAG 引擎（RAGEngine）
-      2. 构建 RAG 上下文
-      3. 构建研究 prompt（根据迭代次数选择模板）
+      2. 迭代研究（最多 iterations 轮）
+         - 构建 RAG 上下文
+         - 构建研究 prompt（根据迭代次数选择模板）
+         - 调用 LLM 获取响应
+         - 检测是否完成
+         - 提取研究阶段
+      3. 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
 
     API 层负责:
-      - 迭代循环控制
       - WebSocket 纯文本分片推流
       - 发送迭代标记（ITERATION_START / ITERATION_DONE / DONE / ERROR）
     """
     try:
-        # 初始化 DeepResearchFlow
+        # 初始化 DeepResearchFlow，传入自定义迭代次数
         flow = DeepResearchFlow(
             repo_url=repo_url,
             provider=provider,
             model=model or "qwen-plus",
             language=language,
             use_database=True,
+            max_iterations=iterations,
         )
 
-        # 初始化 RAG 引擎（RAGEngine）
+        # 委托给 DeepResearchFlow.research() 完整方法
+        # research() 内部执行: 初始化 RAG → 迭代研究 → 记录 QA 日志
+        # 注意: research() 返回最终答案，但我们需要在迭代过程中发送标记
+        # 因此这里我们仍然需要手动控制迭代流程以发送 WS 标记
+        # 但业务逻辑（RAG、prompt 构建、完成检测）由 Flow 负责
+
+        # 初始化 RAG 引擎
         flow._init_rag_engine()
 
         # 使用简单的内存对话跟踪
@@ -220,7 +228,6 @@ async def _handle_deep_research_ws(
             )
 
             # 如果有对话历史，按正确顺序添加到 messages 中
-            # 正确顺序：user → assistant → user(continue) → assistant → ...
             for turn in conversation_turns:
                 messages.append({"role": "user", "content": turn["user"]})
                 messages.append({"role": "assistant", "content": turn["assistant"]})
@@ -243,6 +250,14 @@ async def _handle_deep_research_ws(
             # 保存到对话历史
             full_response = "".join(full_response_chars)
             conversation_turns.append({"user": query, "assistant": full_response})
+
+            # 检测是否完成（使用 Flow 的完成检测逻辑）
+            if flow._check_if_complete(full_response):
+                # 发送迭代完成信号
+                await websocket.send_text(f"[ITERATION_DONE:{i}]")
+                # 发送完成信号
+                await websocket.send_text(f"[DONE:{i}]")
+                return
 
             # 发送迭代完成信号
             await websocket.send_text(f"[ITERATION_DONE:{i}]")

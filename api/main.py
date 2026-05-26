@@ -22,7 +22,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 # 配置日志（必须在导入其他模块之前）
-from config.logging_config import setup_logging
+from core.config.logging_config import setup_logging
 
 setup_logging()
 

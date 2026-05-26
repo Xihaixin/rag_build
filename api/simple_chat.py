@@ -6,7 +6,8 @@ SimpleChatFlow 和 DeepResearchFlow 进行业务逻辑处理。
 
 架构说明 (Phase 4 重构):
   - API 层只负责 HTTP 协议处理（请求解析、SSE 流式响应）
-  - 业务逻辑（RAG 检索、prompt 构建）委托给 core/flows/ 中的 Flow 类
+  - 业务逻辑（RAG 检索、prompt 构建、QA 日志记录）委托给 core/flows/ 中的 Flow 类
+  - Flow 类的完整方法 (chat() / research()) 负责完整的业务流程，包括 QA 日志记录
   - LLM 流式调用使用 core.utils.llm.call_llm_stream()
 """
 
@@ -69,6 +70,11 @@ async def chat_completions_stream(request: ChatCompletionRequest):
     业务逻辑委托给:
       - SimpleChatFlow — 普通聊天模式
       - DeepResearchFlow — 深度研究模式
+
+    架构说明:
+      Flow 类的完整方法 (chat() / research()) 负责完整的业务流程，
+      包括 RAG 检索、prompt 构建、LLM 调用、QA 日志记录。
+      API 层将 Flow 返回的完整结果以 SSE 格式流式返回给客户端。
     """
     try:
         query = request.messages[-1]["content"] if request.messages else ""
@@ -118,15 +124,17 @@ async def _handle_simple_chat(
     repo_name: str,
 ) -> StreamingResponse:
     """
-    处理普通聊天模式 — 委托给 SimpleChatFlow
+    处理普通聊天模式 — 委托给 SimpleChatFlow.chat()
 
-    SimpleChatFlow 负责:
+    SimpleChatFlow.chat() 负责完整的业务流程:
       1. 初始化 RAG 引擎（RAGEngine）
       2. 构建 RAG 上下文
       3. 构建 prompt（系统指令 + 上下文 + 用户问题）
+      4. 调用 LLM 获取完整响应
+      5. 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
 
     API 层负责:
-      - 流式调用 LLM 并返回 SSE 响应
+      - 将 Flow 返回的完整结果以 SSE 格式流式返回
     """
     # 初始化 SimpleChatFlow（repo_url 在此路径下保证不为 None）
     repo_url: str = request.repo_url  # type: ignore[assignment]
@@ -138,25 +146,25 @@ async def _handle_simple_chat(
         use_database=True,
     )
 
-
     async def response_stream():
         try:
-            # 步骤 1: 初始化 RAG 引擎
-            flow._init_rag_engine()
+            # 委托给 SimpleChatFlow.chat() 完整方法
+            # chat() 内部执行: 初始化 RAG → 构建上下文 → 构建 prompt → 调用 LLM → 记录 QA 日志
+            full_response = await flow.chat(query)
 
-            # 步骤 2: 构建 RAG 上下文
-            context = flow._build_context(query)
+            # 将完整响应以 SSE 格式流式返回
+            # 模拟流式输出，每个句子/段落作为一个 chunk
+            # 这样前端可以逐步显示内容
+            yield f"data: {json.dumps({'type': 'start'})}\n\n"
 
-            # 步骤 3: 构建 prompt
-            messages = flow._build_prompt(query, context)
+            # 按行分割，逐行流式输出
+            lines = full_response.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip():
+                    chunk = line + ('\n' if i < len(lines) - 1 else '')
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
 
-            # 步骤 4: 流式调用 LLM
-            async for chunk in call_llm_stream(
-                provider=request.provider,
-                model=request.model,
-                messages=messages,
-            ):
-                yield chunk
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
         except Exception as e:
             logger.error(f"Simple chat stream error: {e}")
@@ -179,76 +187,62 @@ async def _handle_deep_research(
     repo_name: str,
 ) -> StreamingResponse:
     """
-    处理深度研究模式 — 委托给 DeepResearchFlow
+    处理深度研究模式 — 委托给 DeepResearchFlow.research()
 
-    DeepResearchFlow 负责:
+    DeepResearchFlow.research() 负责完整的业务流程:
       1. 初始化 RAG 引擎（RAGEngine）
-      2. 构建 RAG 上下文
-      3. 构建研究 prompt（根据迭代次数选择模板）
+      2. 迭代研究（最多 5 轮）
+         - 构建 RAG 上下文
+         - 构建研究 prompt（根据迭代次数选择模板）
+         - 调用 LLM 获取响应
+         - 检测是否完成
+         - 提取研究阶段
+      3. 记录问答日志到 qa_logs 表（通过 RAGEngine.log_qa()）
 
     API 层负责:
-      - 迭代循环控制
-      - 流式调用 LLM 并返回 SSE 响应
+      - 将 Flow 返回的完整结果以 SSE 格式流式返回
       - 发送迭代标记（iteration/done）
     """
     # 初始化 DeepResearchFlow（repo_url 在此路径下保证不为 None）
     repo_url: str = request.repo_url  # type: ignore[assignment]
+    total_iterations = request.research_iterations
     flow = DeepResearchFlow(
         repo_url=repo_url,
         provider=request.provider,
         model=request.model or "qwen-plus",
         language=request.language or "en",
         use_database=True,
+        max_iterations=total_iterations,
     )
-
-    total_iterations = request.research_iterations
-    conversation_turns: List[Dict[str, str]] = []
 
     async def research_stream():
         try:
-            # 初始化 RAG 引擎
-            flow._init_rag_engine()
+            # 委托给 DeepResearchFlow.research() 完整方法
+            # research() 内部执行: 初始化 RAG → 迭代研究 → 记录 QA 日志
+            final_answer = await flow.research(query)
 
-            for iteration in range(1, total_iterations + 1):
-                # 构建 RAG 上下文
-                context = flow._build_context(query)
-
-                # 构建研究 prompt
-                messages = flow._build_research_prompt(
-                    query=query,
-                    iteration=iteration,
-                    context=context,
-                )
-
-                # 如果有对话历史，按正确顺序添加到 messages 中
-                # 正确顺序：user → assistant → user(continue) → assistant → ...
-                for turn in conversation_turns:
-                    messages.append({"role": "user", "content": turn["user"]})
-                    messages.append({"role": "assistant", "content": turn["assistant"]})
-                # 添加继续研究的 user 消息
-                messages.append({"role": "user", "content": "[DEEP RESEARCH] Continue the research"})
-
-                # 发送迭代标记
-                yield f"data: {json.dumps({'type': 'iteration', 'iteration': iteration, 'total': total_iterations})}\n\n"
-
-                # 流式调用 LLM
-                full_response = ""
-                async for chunk in call_llm_stream(
-                    provider=request.provider,
-                    model=request.model,
-                    messages=messages,
-                ):
-                    full_response += chunk
-                    yield chunk
-
-                # 记录对话
-                conversation_turns.append({
-                    "user": f"{query} (iteration {iteration}/{total_iterations})",
-                    "assistant": full_response,
+            # 发送研究阶段信息
+            stages_data = []
+            for stage in flow.research_stages:
+                stages_data.append({
+                    "title": stage.title,
+                    "content": stage.content,
+                    "iteration": stage.iteration,
+                    "type": stage.type,
                 })
 
-            # 发送完成标记
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            yield f"data: {json.dumps({'type': 'stages', 'stages': stages_data})}\n\n"
+
+            # 将最终答案以 SSE 格式流式返回
+            yield f"data: {json.dumps({'type': 'start'})}\n\n"
+
+            lines = final_answer.split('\n')
+            for i, line in enumerate(lines):
+                if line.strip():
+                    chunk = line + ('\n' if i < len(lines) - 1 else '')
+                    yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done', 'iterations': flow.current_iteration})}\n\n"
 
         except Exception as e:
             logger.error(f"Deep research stream error: {e}")

@@ -69,9 +69,6 @@ class DeepResearchFlow(BaseFlow):
         "This concludes our research",
     ]
 
-    # 最大迭代次数 — 对应前端 Ask.tsx 中的 MAX_RESEARCH_ITERATIONS
-    MAX_ITERATIONS = 5
-
     def __init__(
         self,
         repo_url: str,
@@ -79,6 +76,7 @@ class DeepResearchFlow(BaseFlow):
         model: str = "gemini-2.0-flash-exp",
         language: str = "zh",
         use_database: bool = True,
+        max_iterations: int = 5,
     ):
         # 调用 BaseFlow.__init__ 初始化公共属性
         super().__init__(
@@ -96,6 +94,7 @@ class DeepResearchFlow(BaseFlow):
         self.current_iteration: int = 0
         self.is_complete: bool = False
         self.final_answer: str = ""
+        self.max_iterations: int = max_iterations
 
         # RAG 引擎（延迟初始化）
         self.rag_engine: Optional[RAGEngine] = None
@@ -104,7 +103,7 @@ class DeepResearchFlow(BaseFlow):
         logger.info(f"  仓库: {repo_url}")
         logger.info(f"  提供者: {provider}/{model}")
         logger.info(f"  语言: {self.language_name}")
-        logger.info(f"  最大迭代: {self.MAX_ITERATIONS}")
+        logger.info(f"  最大迭代: {self.max_iterations}")
 
     def _init_rag_engine(self) -> Optional[RAGEngine]:
         """
@@ -195,7 +194,7 @@ class DeepResearchFlow(BaseFlow):
         # 选择 prompt 模板
         if iteration == 1:
             prompt_template = DEEP_RESEARCH_FIRST_ITERATION_PROMPT
-        elif iteration >= self.MAX_ITERATIONS:
+        elif iteration >= self.max_iterations:
             prompt_template = DEEP_RESEARCH_FINAL_ITERATION_PROMPT
         else:
             prompt_template = DEEP_RESEARCH_INTERMEDIATE_ITERATION_PROMPT
@@ -208,7 +207,7 @@ class DeepResearchFlow(BaseFlow):
             "language_name": self.language_name,
         }
         # 中间迭代模板有 {research_iteration} 占位符
-        if iteration > 1 and iteration < self.MAX_ITERATIONS:
+        if iteration > 1 and iteration < self.max_iterations:
             prompt_kwargs["research_iteration"] = str(iteration)
 
         research_prompt = prompt_template.format(**prompt_kwargs)
@@ -254,7 +253,7 @@ class DeepResearchFlow(BaseFlow):
             if "## Research Plan" in content or "## 研究计划" in content:
                 stage_type = "plan"
                 title = "研究计划"
-        elif iteration >= self.MAX_ITERATIONS or self._check_if_complete(content):
+        elif iteration >= self.max_iterations or self._check_if_complete(content):
             stage_type = "conclusion"
             title = "最终结论"
 
@@ -282,7 +281,7 @@ class DeepResearchFlow(BaseFlow):
         logger.info("DeepResearchFlow.research()")
         logger.info("=" * 60)
         logger.info(f"研究问题: {query}")
-        logger.info(f"最大迭代: {self.MAX_ITERATIONS}")
+        logger.info(f"最大迭代: {self.max_iterations}")
 
         start_time = time.time()
 
@@ -294,10 +293,10 @@ class DeepResearchFlow(BaseFlow):
         context = self._build_context(query)
 
         # 迭代研究循环
-        for iteration in range(1, self.MAX_ITERATIONS + 1):
+        for iteration in range(1, self.max_iterations + 1):
             self.current_iteration = iteration
             logger.info(f"\n{'─' * 50}")
-            logger.info(f"迭代 {iteration}/{self.MAX_ITERATIONS}")
+            logger.info(f"迭代 {iteration}/{self.max_iterations}")
             logger.info(f"{'─' * 50}")
 
             # 构建研究 prompt
@@ -336,7 +335,7 @@ class DeepResearchFlow(BaseFlow):
                 break
 
             # 如果不是最后一轮，准备继续研究
-            if iteration < self.MAX_ITERATIONS:
+            if iteration < self.max_iterations:
                 # 对应前端 Ask.tsx 中 continueResearch() 的逻辑：
                 # 添加 "[DEEP RESEARCH] Continue the research" 到消息历史
                 continue_prompt = "[DEEP RESEARCH] Continue the research"
@@ -344,7 +343,7 @@ class DeepResearchFlow(BaseFlow):
                 logger.info("  准备继续下一轮研究...")
 
         if not self.is_complete:
-            logger.info(f"达到最大迭代次数 ({self.MAX_ITERATIONS})，研究结束")
+            logger.info(f"达到最大迭代次数 ({self.max_iterations})，研究结束")
             self.final_answer = self.messages[-1]["content"] if self.messages else ""
 
         latency_ms = int((time.time() - start_time) * 1000)
@@ -373,7 +372,7 @@ class DeepResearchFlow(BaseFlow):
         logger.info("=" * 60)
 
         logger.info(f"研究问题: {self.messages[0]['content'] if self.messages else 'N/A'}")
-        logger.info(f"总迭代: {self.current_iteration}/{self.MAX_ITERATIONS}")
+        logger.info(f"总迭代: {self.current_iteration}/{self.max_iterations}")
         logger.info(f"是否完成: {'是' if self.is_complete else '否'}")
         logger.info(f"")
 
