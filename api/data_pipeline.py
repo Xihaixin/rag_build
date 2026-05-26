@@ -176,13 +176,16 @@ class DatabaseManager:
         repo_name = self._extract_repo_name_from_url(repo_url_or_path, repo_type)
         self._repo_name = repo_name
 
+        owner = self._extract_owner_from_url(repo_url_or_path)
+
         project = ProjectRepository.get_or_create(
             name=repo_name,
             repo_url=repo_url_or_path,
+            owner=owner,
         )
         self._project_id = str(project["id"])
 
-        logger.info(f"Database prepared: project={repo_name}, id={self._project_id}")
+        logger.info(f"Database prepared: project={repo_name}, owner={owner}, id={self._project_id}")
         return self._project_id
 
     def reset_database(self):
@@ -230,6 +233,28 @@ class DatabaseManager:
         if repo_type in ("gitee", "github") and ("gitee.com" in repo_url_or_path or "github.com" in repo_url_or_path):
             return repo_url_or_path.rstrip("/").split("/")[-1]
         return Path(repo_url_or_path).name
+
+    def _extract_owner_from_url(self, repo_url_or_path: str) -> str:
+        """从 URL 或本地路径提取 owner 信息
+
+        规则：
+        - 如果是 URL，使用 split("/") 分割后取倒数第二个作为 owner
+        - 如果分割后没有找到 owner，统一命名为 "default"
+        - 如果是本地路径，命名为 "local"
+        """
+        # 判断是否为 URL（包含协议或常见域名）
+        is_url = any(domain in repo_url_or_path for domain in [
+            "http://", "https://", "github.com", "gitlab.com",
+            "bitbucket.org", "gitee.com",
+        ])
+        if is_url:
+            parts = repo_url_or_path.rstrip("/").split("/")
+            if len(parts) >= 2:
+                # 倒数第二个就是 owner（例如 github.com/user/repo → user）
+                return parts[-2]
+            return "default"
+        # 本地路径
+        return "local"
 
     def _create_repo(
         self,

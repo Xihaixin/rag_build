@@ -151,6 +151,23 @@ class DataIngestor:
             raise ValueError("repo_url 和 local_path 均为空，无法提取仓库名")
         return os.path.basename(os.path.normpath(local_path.rstrip("/\\")))
 
+    def _extract_owner(self) -> str:
+        """从 repo_url 或 local_path 提取 owner 信息
+
+        规则：
+        - 如果是 URL（有 repo_url），使用 split("/") 分割后取倒数第二个作为 owner
+        - 如果分割后没有找到 owner，统一命名为 "default"
+        - 如果是本地项目（local_path），命名为 "local"
+        """
+        if self.repo_url:
+            parts = self.repo_url.rstrip("/").split("/")
+            if len(parts) >= 2:
+                # 倒数第二个就是 owner（例如 github.com/user/repo → user）
+                return parts[-2]
+            return "default"
+        # 本地项目
+        return "local"
+
     # ── 步骤 1: 下载仓库 ──────────────────────────────────────────────
 
     def download(self) -> str:
@@ -211,7 +228,7 @@ class DataIngestor:
         project = ProjectRepository.get_or_create(
             name=self.repo_name,
             repo_url=self.repo_url,
-            owner=None,
+            owner=self._extract_owner(),
             repo_type=self.repo_type,
             local_path=self.repo_local_path,
         )
