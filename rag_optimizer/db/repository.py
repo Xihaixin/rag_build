@@ -522,3 +522,115 @@ class WikiPageRepository:
             "DELETE FROM wiki_pages WHERE project_id = %s",
             (project_id,)
         )
+
+
+# ============================================================
+# Wiki 缓存 Repository
+# ============================================================
+
+
+class WikiCacheRepository:
+    """Wiki 缓存数据访问（存储 Wiki 结构 + 元数据）"""
+
+    @staticmethod
+    def upsert(
+        project_id: str,
+        language: str,
+        structure_json: dict,
+        repo_owner: Optional[str] = None,
+        repo_name: Optional[str] = None,
+        repo_type: Optional[str] = None,
+        repo_url: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """插入或更新 Wiki 缓存。
+
+        使用 (project_id, language) 唯一约束进行 UPSERT。
+        对应 SQL: wiki_caches 表的 UNIQUE (project_id, language)。
+
+        Args:
+            project_id: 项目 ID
+            language: 语言代码
+            structure_json: Wiki 结构 JSON（包含 sections、pages 列表等）
+            repo_owner: 仓库所有者
+            repo_name: 仓库名称
+            repo_type: 仓库类型（github/gitlab/gitee）
+            repo_url: 仓库 URL
+            provider: LLM 提供者
+            model: LLM 模型
+
+        Returns:
+            str: 缓存记录 ID
+        """
+        result = sync_conn.execute(
+            """INSERT INTO wiki_caches
+               (project_id, language, structure_json,
+                repo_owner, repo_name, repo_type, repo_url,
+                provider, model)
+               VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (project_id, language) DO UPDATE SET
+               structure_json = EXCLUDED.structure_json,
+               repo_owner = EXCLUDED.repo_owner,
+               repo_name = EXCLUDED.repo_name,
+               repo_type = EXCLUDED.repo_type,
+               repo_url = EXCLUDED.repo_url,
+               provider = EXCLUDED.provider,
+               model = EXCLUDED.model,
+               updated_at = NOW()
+               RETURNING id""",
+            (project_id, language, json.dumps(structure_json),
+             repo_owner, repo_name, repo_type, repo_url,
+             provider, model)
+        )
+        return str(result[0]["id"])
+
+    @staticmethod
+    def get_by_project(project_id: str, language: str) -> Optional[dict]:
+        """获取项目的 Wiki 缓存。
+
+        Args:
+            project_id: 项目 ID
+            language: 语言代码
+
+        Returns:
+            Optional[dict]: 缓存记录，未找到返回 None
+        """
+        result = sync_conn.execute(
+            "SELECT * FROM wiki_caches WHERE project_id = %s AND language = %s",
+            (project_id, language)
+        )
+        return dict(result[0]) if result else None
+
+    @staticmethod
+    def delete(project_id: str, language: str) -> bool:
+        """删除项目的 Wiki 缓存。
+
+        Args:
+            project_id: 项目 ID
+            language: 语言代码
+
+        Returns:
+            bool: 是否成功删除
+        """
+        result = sync_conn.execute(
+            "DELETE FROM wiki_caches WHERE project_id = %s AND language = %s RETURNING id",
+            (project_id, language)
+        )
+        return len(result) > 0 if result else False
+
+    @staticmethod
+    def delete_by_project(project_id: str):
+        """删除项目的所有语言 Wiki 缓存。"""
+        sync_conn.execute(
+            "DELETE FROM wiki_caches WHERE project_id = %s",
+            (project_id,)
+        )
+
+    @staticmethod
+    def list_all() -> List[dict]:
+        """列出所有 Wiki 缓存记录（按更新时间倒序）。"""
+        result = sync_conn.execute(
+            "SELECT * FROM wiki_caches ORDER BY updated_at DESC"
+        )
+        return [dict(r) for r in result] if result else []

@@ -395,6 +395,41 @@ CREATE INDEX IF NOT EXISTS idx_conv_turns_conversation ON conversation_turns(con
 COMMENT ON TABLE conversations IS '对话历史表，持久化用户与 LLM 的对话记录';
 
 -- ============================================================
+-- 15. Wiki 缓存表（存储 Wiki 结构 + 元数据）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS wiki_caches (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+
+    language        TEXT NOT NULL DEFAULT 'zh',
+
+    -- Wiki 结构（JSONB，包含 sections、page hierarchy 等）
+    structure_json  JSONB NOT NULL DEFAULT '{}',
+
+    -- 仓库信息
+    repo_owner      TEXT,
+    repo_name       TEXT,
+    repo_type       TEXT DEFAULT 'github',
+    repo_url        TEXT,
+
+    -- LLM 配置
+    provider        TEXT,
+    model           TEXT,
+
+    -- 时间戳
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE (project_id, language)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wiki_caches_project ON wiki_caches(project_id);
+
+COMMENT ON TABLE wiki_caches IS 'Wiki 缓存表，存储 Wiki 结构（sections、page hierarchy）和元数据';
+COMMENT ON COLUMN wiki_caches.structure_json IS 'Wiki 结构 JSON，包含 sections、pages 列表、rootSections 等';
+COMMENT ON COLUMN wiki_caches.repo_url IS '仓库 URL，用于前端展示和链接';
+
+-- ============================================================
 -- 插入默认嵌入模型数据
 -- ============================================================
 INSERT INTO embedding_models (name, provider, dimensions, description) VALUES
